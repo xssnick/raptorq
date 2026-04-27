@@ -199,3 +199,77 @@ func Benchmark_EncodeDecodeFuzz(b *testing.B) {
 		}
 	}
 }
+
+func Benchmark_Decode80PercentFastRecovery(b *testing.B) {
+	str := make([]byte, 1<<20)
+	rand.Read(str)
+
+	const symSz uint32 = 768
+	r := NewRaptorQ(symSz)
+	enc, err := r.CreateEncoder(str)
+	if err != nil {
+		b.Fatal("create encoder err", err)
+	}
+
+	k := enc.params._K
+	fastNum := (k*80 + 99) / 100
+	if fastNum >= k {
+		fastNum = k - 1
+	}
+	recoverNum := k - fastNum
+
+	fastSymbols := make([][]byte, fastNum)
+	for i := uint32(0); i < fastNum; i++ {
+		fastSymbols[i] = enc.GenSymbol(i)
+	}
+
+	repairSymbols := make([][]byte, recoverNum)
+	for i := uint32(0); i < recoverNum; i++ {
+		repairSymbols[i] = enc.GenSymbol(k + i)
+	}
+
+	decode := func() ([]byte, error) {
+		dec, err := r.CreateDecoder(uint32(len(str)))
+		if err != nil {
+			return nil, err
+		}
+
+		for i := uint32(0); i < fastNum; i++ {
+			if _, err = dec.AddSymbol(i, fastSymbols[i]); err != nil {
+				return nil, err
+			}
+		}
+		for i := uint32(0); i < recoverNum; i++ {
+			if _, err = dec.AddSymbol(k+i, repairSymbols[i]); err != nil {
+				return nil, err
+			}
+		}
+
+		ok, data, err := dec.Decode()
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, errNotEnoughSymbols
+		}
+		return data, nil
+	}
+
+	data, err := decode()
+	if err != nil {
+		b.Fatal("decode err", err)
+	}
+	if !bytes.Equal(data, str) {
+		b.Fatal("initial data not eq decoded")
+	}
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(str)))
+	b.ResetTimer()
+
+	for n := 0; n < b.N; n++ {
+		if _, err = decode(); err != nil {
+			b.Fatal("decode err", err)
+		}
+	}
+}

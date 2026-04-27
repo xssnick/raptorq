@@ -58,7 +58,6 @@ func (m *MatrixGF256) SetFrom(g *MatrixGF256, rowOffset, colOffset uint32) {
 }
 
 func (m *MatrixGF256) SetFromBlock(blockFrom *MatrixGF256, blockRowOffset, blockColOffset, blockRowSize, blockColSize, setRowOffset, setColOffset uint32) {
-	//m.SetFrom(blockFrom.GetBlock(blockRowOffset, blockColOffset, blockRowSize, blockColSize), setRowOffset, setColOffset)
 	for row := blockRowOffset; row < blockRowSize+blockRowOffset; row++ {
 		copy(m.GetRow(setRowOffset + row - blockRowOffset)[setColOffset:], blockFrom.GetRow(row)[blockColOffset:blockColOffset+blockColSize])
 	}
@@ -86,6 +85,49 @@ func (m *MatrixGF256) ApplyPermutation(permutation []uint32) *MatrixGF256 {
 		res.RowSet(row, m.GetRow(permutation[row]))
 	}
 	return res
+}
+
+func (m *MatrixGF256) ApplyPermutationInPlace(permutation []uint32) *MatrixGF256 {
+	if len(permutation) != int(m.Rows) || m.Rows <= 1 {
+		return m.ApplyPermutation(permutation)
+	}
+
+	scratch := make([]byte, int(m.Rows)+int(m.Cols))
+	return m.ApplyPermutationInPlaceScratch(permutation, scratch[:m.Rows], scratch[m.Rows:])
+}
+
+func (m *MatrixGF256) ApplyPermutationInPlaceScratch(permutation []uint32, visited, tmp []byte) *MatrixGF256 {
+	if len(permutation) != int(m.Rows) || m.Rows <= 1 {
+		return m.ApplyPermutation(permutation)
+	}
+	if len(visited) < int(m.Rows) || len(tmp) < int(m.Cols) {
+		return m.ApplyPermutationInPlace(permutation)
+	}
+
+	visited = visited[:m.Rows]
+	tmp = tmp[:m.Cols]
+
+	for start := uint32(0); start < m.Rows; start++ {
+		if visited[start] != 0 || permutation[start] == start {
+			visited[start] = 1
+			continue
+		}
+
+		copy(tmp, m.GetRow(start))
+		pos := start
+		for {
+			visited[pos] = 1
+			next := permutation[pos]
+			if next == start {
+				break
+			}
+			copy(m.GetRow(pos), m.GetRow(next))
+			pos = next
+		}
+		copy(m.GetRow(pos), tmp)
+	}
+
+	return m
 }
 
 func (m *MatrixGF256) MulSparse(s *MatrixGF256) *MatrixGF256 {
@@ -126,9 +168,9 @@ func (m *MatrixGF256) ToGF2(rowFrom, colFrom, rowSize, colSize uint32) *PlainMat
 
 func (m *MatrixGF256) GetCols(buf []uint32, col uint32) []uint32 {
 	buf = buf[:0]
-	for i := uint32(0); i < m.Rows; i++ {
-		if c := m.Get(i, col); c == 1 {
-			buf = append(buf, i)
+	for row, offset := uint32(0), col; row < m.Rows; row, offset = row+1, offset+m.Cols {
+		if m.Data[offset] == 1 {
+			buf = append(buf, row)
 		}
 	}
 	return buf

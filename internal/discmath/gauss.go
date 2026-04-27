@@ -4,10 +4,10 @@ import "errors"
 
 var ErrNotSolvable = errors.New("not solvable")
 
-func GaussianElimination(a, d *MatrixGF256) (*MatrixGF256, error) {
+func GaussianElimination(a, d *MatrixGF256, rowPerm []uint32, permutationScratch []byte) (*MatrixGF256, error) {
 	rows := a.RowsNum()
 
-	rowPerm := make([]uint32, rows)
+	rowPerm = rowPerm[:rows]
 	for i := uint32(0); i < rows; i++ {
 		rowPerm[i] = i
 	}
@@ -42,5 +42,5 @@ func GaussianElimination(a, d *MatrixGF256) (*MatrixGF256, error) {
 		}
 	}
 
-	return d.ApplyPermutation(rowPerm), nil
+	return d.ApplyPermutationInPlaceScratch(rowPerm, permutationScratch[:rows], permutationScratch[rows:]), nil
 }

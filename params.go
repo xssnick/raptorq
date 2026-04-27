@@ -2,7 +2,9 @@ package raptorq
 
 import (
 	"fmt"
-	"github.com/xssnick/raptorq/discmath"
+	"sync"
+
+	"github.com/xssnick/raptorq/internal/discmath"
 )
 
 type encodingRow struct {
@@ -26,11 +28,28 @@ type raptorParams struct {
 	_P1      uint32
 	_U       uint32
 	_B       uint32
+
+	zeroSymbol []byte
 }
+
+type paramsCacheKey struct {
+	symbolSize uint32
+	dataSize   uint32
+}
+
+var paramsCache sync.Map
 
 func (r *RaptorQ) calcParams(dataSize uint32) (*raptorParams, error) {
 	if r.symbolSz == 0 {
 		return nil, fmt.Errorf("symbol size cannot be zero")
+	}
+
+	key := paramsCacheKey{
+		symbolSize: r.symbolSz,
+		dataSize:   dataSize,
+	}
+	if cached, ok := paramsCache.Load(key); ok {
+		return cached.(*raptorParams), nil
 	}
 
 	k := (dataSize + r.symbolSz - 1) / r.symbolSz
@@ -48,6 +67,8 @@ func (r *RaptorQ) calcParams(dataSize uint32) (*raptorParams, error) {
 		_W:       raw.W,
 		_L:       raw.KPadded + raw.S + raw.H,
 		_B:       raw.W - raw.S,
+
+		zeroSymbol: make([]byte, r.symbolSz),
 	}
 
 	p._P = p._L - p._W
@@ -58,7 +79,8 @@ func (r *RaptorQ) calcParams(dataSize uint32) (*raptorParams, error) {
 		p._P1++
 	}
 
-	return p, nil
+	actual, _ := paramsCache.LoadOrStore(key, p)
+	return actual.(*raptorParams), nil
 }
 
 var degreeDistribution = []uint32{
@@ -113,13 +135,13 @@ func (p *raptorParams) calcEncodingRow(x uint32) encodingRow {
 	}
 }
 
-func (p *raptorParams) hdpcMultiply(v *discmath.MatrixGF256) *discmath.MatrixGF256 {
+func (p *raptorParams) hdpcMultiply(arena *matrixArena, v *discmath.MatrixGF256) *discmath.MatrixGF256 {
 	alpha := discmath.OctExp(1)
 	for i := uint32(1); i < v.RowsNum(); i++ {
 		v.RowAddMul(i, v.GetRow(i-1), alpha)
 	}
 
-	u := discmath.NewMatrixGF256(p._H, v.ColsNum())
+	u := arena.newGF256(p._H, v.ColsNum())
 	for i := uint32(0); i < p._H; i++ {
 		u.RowAddMul(i, v.GetRow(v.RowsNum()-1), discmath.OctExp(i%255))
 	}
@@ -137,56 +159,60 @@ func (r *encodingRow) Size() uint32 {
 	return r.d + r.d1
 }
 
-func (r *encodingRow) encode(aUpper *discmath.MatrixGF256, ri uint32, p *raptorParams) {
-	aUpper.Set(ri+p._S, r.b, 1)
+func (r *encodingRow) encode(aUpper *upperMatrixBuilder, ri uint32, p *raptorParams) {
+	aUpper.set(ri+p._S, r.b)
 
 	for j := uint32(1); j < r.d; j++ {
 		r.b = (r.b + r.a) % p._W
-		aUpper.Set(ri+p._S, r.b, 1)
+		aUpper.set(ri+p._S, r.b)
 	}
 
 	for r.b1 >= p._P {
 		r.b1 = (r.b1 + r.a1) % p._P1
 	}
 
-	aUpper.Set(ri+p._S, p._W+r.b1, 1)
+	aUpper.set(ri+p._S, p._W+r.b1)
 	for j := uint32(1); j < r.d1; j++ {
 		r.b1 = (r.b1 + r.a1) % p._P1
 		for r.b1 >= p._P {
 			r.b1 = (r.b1 + r.a1) % p._P1
 		}
-		aUpper.Set(ri+p._S, p._W+r.b1, 1)
+		aUpper.set(ri+p._S, p._W+r.b1)
 	}
 }
 
-func (r *encodingRow) encodeGen(m, relaxed *discmath.MatrixGF256, p *raptorParams) {
-	m.RowAdd(0, relaxed.GetRow(r.b))
+func (r encodingRow) encodeGen(dst []byte, relaxed *discmath.MatrixGF256, p *raptorParams) {
+	discmath.OctVecAdd(dst, relaxed.GetRow(r.b))
 
 	for j := uint32(1); j < r.d; j++ {
 		r.b = (r.b + r.a) % p._W
-		m.RowAdd(0, relaxed.GetRow(r.b))
+		discmath.OctVecAdd(dst, relaxed.GetRow(r.b))
 	}
 
 	for r.b1 >= p._P {
 		r.b1 = (r.b1 + r.a1) % p._P1
 	}
 
-	m.RowAdd(0, relaxed.GetRow(p._W+r.b1))
+	discmath.OctVecAdd(dst, relaxed.GetRow(p._W+r.b1))
 	for j := uint32(1); j < r.d1; j++ {
 		r.b1 = (r.b1 + r.a1) % p._P1
 		for r.b1 >= p._P {
 			r.b1 = (r.b1 + r.a1) % p._P1
 		}
-		m.RowAdd(0, relaxed.GetRow(p._W+r.b1))
+		discmath.OctVecAdd(dst, relaxed.GetRow(p._W+r.b1))
 	}
 }
 
 func (p *raptorParams) genSymbol(relaxed *discmath.MatrixGF256, symbolSz, id uint32) []byte {
-	m := discmath.NewMatrixGF256(1, symbolSz)
-	row := p.calcEncodingRow(id)
-	row.encodeGen(m, relaxed, p)
+	out := make([]byte, symbolSz)
+	p.genSymbolInto(out, relaxed, id)
+	return out
+}
 
-	return m.GetRow(0)
+func (p *raptorParams) genSymbolInto(dst []byte, relaxed *discmath.MatrixGF256, id uint32) {
+	clear(dst)
+	row := p.calcEncodingRow(id)
+	row.encodeGen(dst, relaxed, p)
 }
 
 func isPrime(n uint32) bool {

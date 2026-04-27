@@ -5,87 +5,6 @@ import (
 	"strings"
 )
 
-type MatrixGF2 struct {
-	rows uint32
-	cols uint32
-	data []uint8
-}
-
-func NewMatrixGF2(rows, cols uint32) *MatrixGF2 {
-	return &MatrixGF2{
-		rows: rows,
-		cols: cols,
-		data: make([]uint8, rows*cols),
-	}
-}
-
-func (m *MatrixGF2) RowsNum() uint32 {
-	return m.rows
-}
-
-func (m *MatrixGF2) ColsNum() uint32 {
-	return m.cols
-}
-
-func (m *MatrixGF2) RowAdd(row uint32, what []uint8) {
-	r := m.GetRow(row)
-	for i, u := range what {
-		if u > 1 {
-			panic("not GF2 data")
-		}
-		r[i] ^= u
-	}
-}
-
-func (m *MatrixGF2) Set(row, col uint32) {
-	m.data[row*m.cols+col] = 1
-}
-
-func (m *MatrixGF2) Unset(row, col uint32) {
-	m.data[row*m.cols+col] = 0
-}
-
-func (m *MatrixGF2) Get(row, col uint32) bool {
-	return m.data[row*m.cols+col] > 0
-}
-
-func (m *MatrixGF2) GetRow(row uint32) []uint8 {
-	return m.data[row*m.cols : row*m.cols+m.cols]
-}
-
-func (m *MatrixGF2) Mul(s *MatrixGF256) *MatrixGF2 {
-	mg := NewMatrixGF2(s.RowsNum(), m.ColsNum())
-	for i, val := range s.Data {
-		if val != 0 {
-			row := uint32(i) / s.Cols
-			col := uint32(i) % s.Cols
-
-			mg.RowAdd(row, m.GetRow(col))
-		}
-	}
-	return mg
-}
-
-func (m *MatrixGF2) ToGF256() *MatrixGF256 {
-	mg := NewMatrixGF256(m.RowsNum(), m.ColsNum())
-	copy(mg.Data, m.data)
-
-	return mg
-}
-
-func (m *MatrixGF2) String() string {
-	return ""
-	/*var rows []string
-	for _, r := range m.rows {
-		var cols []string
-		for _, c := range r {
-			cols = append(cols, fmt.Sprintf("%02x", c))
-		}
-		rows = append(rows, strings.Join(cols, " "))
-	}
-	return strings.Join(rows, "\n")*/
-}
-
 // elSize is a size of array's element in bits
 const elSize = 8
 
@@ -96,14 +15,28 @@ type PlainMatrixGF2 struct {
 }
 
 func NewPlainMatrixGF2(rows, cols uint32) *PlainMatrixGF2 {
+	data := make([]byte, PlainMatrixGF2DataSize(rows, cols))
+	m := &PlainMatrixGF2{}
+	InitPlainMatrixGF2(m, rows, cols, data)
+	return m
+}
+
+func PlainMatrixGF2DataSize(rows, cols uint32) int {
 	rowSize := cols / elSize
 	if cols%elSize > 0 {
 		rowSize++
 	}
+	return int(rows * rowSize)
+}
 
-	data := make([]byte, rows*rowSize)
-
-	return &PlainMatrixGF2{
+func InitPlainMatrixGF2(m *PlainMatrixGF2, rows, cols uint32, data []byte) {
+	rowSize := cols / elSize
+	if cols%elSize > 0 {
+		rowSize++
+	}
+	data = data[:rows*rowSize]
+	clear(data)
+	*m = PlainMatrixGF2{
 		rows:    rows,
 		cols:    cols,
 		rowSize: rowSize,
@@ -149,6 +82,11 @@ func (m *PlainMatrixGF2) RowAdd(row uint32, what []byte) {
 
 func (m *PlainMatrixGF2) Mul(s *MatrixGF256) *PlainMatrixGF2 {
 	mg := NewPlainMatrixGF2(s.RowsNum(), m.ColsNum())
+	return m.MulTo(s, mg)
+}
+
+func (m *PlainMatrixGF2) MulTo(s *MatrixGF256, mg *PlainMatrixGF2) *PlainMatrixGF2 {
+	clear(mg.data)
 
 	for i, val := range s.Data {
 		if val != 0 {
@@ -189,6 +127,19 @@ func (m *PlainMatrixGF2) String() string {
 	}
 
 	return strings.Join(rows, "\n")
+}
+
+func (m *PlainMatrixGF2) RowToGF256(row uint32, dst []byte) {
+	dst = dst[:m.cols]
+	clear(dst)
+
+	col := uint32(0)
+	for _, b := range m.GetRow(row) {
+		for bit := byte(0); bit < elSize && col < m.cols; bit++ {
+			dst[col] = (b >> bit) & 1
+			col++
+		}
+	}
 }
 
 // getElement returns element in matrix by row and col. Possible values: 0 or 1

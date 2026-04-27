@@ -10,10 +10,12 @@ type RawParams struct {
 	W       uint32
 }
 
-func calcRawParams(K uint32) (*RawParams, error) {
-	for _, p := range ParamsTable {
-		if p.KPadded >= K {
-			return &p, nil
+type rawParams = RawParams
+
+func calcRawParams(K uint32) (*rawParams, error) {
+	for i := range ParamsTable {
+		if ParamsTable[i].KPadded >= K {
+			return &ParamsTable[i], nil
 		}
 	}
 	return nil, errors.New("k is too big")

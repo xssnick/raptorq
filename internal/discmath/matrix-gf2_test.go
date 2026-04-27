@@ -441,29 +441,6 @@ func TestPlainMatrixGF2_String(t *testing.T) {
 // --- Benchmarks ---
 
 // Size: 100x100
-// Data size: 10 000 bytes
-// BenchmarkMatrixGF2-12: GetRow+RowAdd    	   114345	     10073 ns/op	       0 B/op	       0 allocs/op
-// BenchmarkMatrixGF2-12: GetRow               25560945	     43.34 ns/op	       0 B/op	       0 allocs/op
-func BenchmarkMatrixGF2(b *testing.B) {
-	const dimension = 100
-
-	m := NewMatrixGF2(dimension, dimension)
-	for i := uint32(0); i < dimension; i++ {
-		m.Set(i, i)
-	}
-
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		for j := uint32(0); j < m.RowsNum()-1; j++ {
-			what := m.GetRow(j + 1)
-			m.RowAdd(j, what)
-		}
-	}
-}
-
-// Size: 100x100
 // Data size: 1300 bytes
 // BenchmarkPlainMatrixGF2-12: GetRow+RowAdd    	 1000000	      1096 ns/op	       0 B/op	       0 allocs/op
 // BenchmarkPlainMatrixGF2-12: GetRow    	         10408053	      109.8 ns/op	       0 B/op	       0 allocs/op
