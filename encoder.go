@@ -21,7 +21,7 @@ func (r *RaptorQ) CreateEncoder(data []byte) (*Encoder, error) {
 
 	symbols := splitToSymbols(param._KPadded, r.symbolSz, data)
 
-	rx, _, err := param.solve(symbols, true)
+	rx, _, err := param.solve(symbols, true, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to relax symbols: %w", err)
 	}

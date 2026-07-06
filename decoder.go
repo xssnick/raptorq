@@ -6,6 +6,7 @@ import (
 	"sync"
 )
 
+// Decoder methods must not be called concurrently.
 type Decoder struct {
 	symbolSz uint32
 	dataSz   uint32
@@ -19,7 +20,30 @@ type Decoder struct {
 	slowIDs     []uint32
 	slowSymbols []byte
 
+	// lazily filled memoization of calcEncodingRow for ids < KPadded,
+	// valid rows always have d >= 1 so the zero value means "not cached";
+	// survives Reset since the params never change
+	rowCache []encodingRow
+
+	// scratch for a truncated tail symbol in decodeInto
+	tailBuf []byte
+
 	pm *raptorParams
+}
+
+func (d *Decoder) encRow(id uint32) encodingRow {
+	if id < d.pm._KPadded {
+		if d.rowCache == nil {
+			d.rowCache = make([]encodingRow, d.pm._KPadded)
+		}
+		r := d.rowCache[id]
+		if r.d == 0 {
+			r = d.pm.calcEncodingRow(id)
+			d.rowCache[id] = r
+		}
+		return r
+	}
+	return d.pm.calcEncodingRow(id)
 }
 
 var symbolSlicePool sync.Pool
@@ -128,6 +152,39 @@ func (d *Decoder) Decode() (bool, []byte, error) {
 		return true, out, nil
 	}
 
+	out := make([]byte, d.pm._K*d.symbolSz)
+	ok, err := d.decodeInto(out)
+	if !ok || err != nil {
+		return false, nil, err
+	}
+	return true, out[:d.dataSz], nil
+}
+
+// DecodeInto decodes the data into dst, which must be at least the data size
+// long, and avoids the output allocation Decode makes. It returns false
+// without an error when more symbols are needed. dst is not touched beyond
+// the data size.
+func (d *Decoder) DecodeInto(dst []byte) (bool, error) {
+	if uint32(len(dst)) < d.dataSz {
+		return false, fmt.Errorf("dst size %d is less than data size %d", len(dst), d.dataSz)
+	}
+	dst = dst[:d.dataSz]
+
+	if d.fastNum+d.slowNum < d.pm._K {
+		return false, fmt.Errorf("not enough symbols to decode")
+	}
+
+	if d.fastNum == d.pm._K {
+		copy(dst, d.fastSymbols[:d.dataSz])
+		return true, nil
+	}
+
+	return d.decodeInto(dst)
+}
+
+// decodeInto recovers the data into out, which is d.dataSz to K*symbolSz long,
+// a possibly truncated last symbol is handled through a temporary buffer.
+func (d *Decoder) decodeInto(out []byte) (bool, error) {
 	// Build system for Solve from known symbols (no payload copy).
 	sz := d.pm._K + d.slowNum
 	if sz < d.pm._KPadded {
@@ -163,28 +220,65 @@ func (d *Decoder) Decode() (bool, []byte, error) {
 	}
 
 	// we have not all fast symbols, try to recover them from slow
-	relaxed, release, err := d.pm.solve(toRelax, false)
+	relaxed, release, err := d.pm.solve(toRelax, false, d.encRow)
 	if err != nil {
 		if errors.Is(err, errNotEnoughSymbols) {
-			return false, nil, nil
+			return false, nil
 		}
-		return false, nil, fmt.Errorf("failed to relax known symbols, err: %w", err)
+		return false, fmt.Errorf("failed to relax known symbols, err: %w", err)
 	}
 	defer release()
 
-	out := make([]byte, d.pm._K*d.symbolSz)
-	for i := uint32(0); i < d.pm._K; i++ {
-		off := i * d.symbolSz
-		dst := out[off : off+d.symbolSz]
-
+	for i := uint32(0); i < d.pm._K; {
 		if d.fastSeen[i] {
-			copy(dst, d.fastSymbol(i))
-		} else {
-			d.pm.genSymbolInto(dst, relaxed, i)
+			// coalesce a run of consecutive fast symbols into one copy,
+			// fastSymbols has the same layout as out
+			start := i
+			for i < d.pm._K && d.fastSeen[i] {
+				i++
+			}
+			off := start * d.symbolSz
+			end := i * d.symbolSz
+			if end > uint32(len(out)) {
+				end = uint32(len(out))
+			}
+			copy(out[off:end], d.fastSymbols[off:end])
+			continue
 		}
+
+		off := i * d.symbolSz
+		end := off + d.symbolSz
+		if end > uint32(len(out)) {
+			end = uint32(len(out))
+		}
+		dst := out[off:end]
+
+		row := d.encRow(i)
+		if uint32(len(dst)) == d.symbolSz {
+			row.encodeGen(dst, relaxed, d.pm)
+		} else {
+			if d.tailBuf == nil {
+				d.tailBuf = make([]byte, d.symbolSz)
+			}
+			row.encodeGen(d.tailBuf, relaxed, d.pm)
+			copy(dst, d.tailBuf)
+		}
+		i++
 	}
 
-	return true, out[:d.dataSz], nil
+	return true, nil
+}
+
+// Reset returns the decoder to its initial empty state so it can be reused
+// for another block of the same data size, keeping the allocated buffers
+// (including the slow symbol index map and the encoding row cache).
+func (d *Decoder) Reset() {
+	clear(d.fastSeen)
+	d.fastNum = 0
+	d.slowNum = 0
+	clear(d.slowIndex)
+	d.slowIDs = d.slowIDs[:0]
+	d.slowSymbols = d.slowSymbols[:0]
 }
 
 func (d *Decoder) fastSymbol(id uint32) []byte {

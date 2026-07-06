@@ -1,7 +1,5 @@
 package raptorq
 
-import "github.com/xssnick/raptorq/internal/discmath"
-
 type inactivateDecoder struct {
 	cols         uint32
 	rows         uint32
@@ -24,25 +22,26 @@ type inactivateDecoder struct {
 	inactiveCols []uint32
 }
 
-func inactivateDecode(arena *matrixArena, l *discmath.MatrixGF256, pi uint32, entries upperMatrixEntries) (side uint32, pRows, pCols []uint32) {
+func inactivateDecode(arena *matrixArena, lRows, lCols, pi uint32, entries upperMatrixEntries) (side uint32, pRows, pCols []uint32) {
 	if !entries.valid() {
 		panic("raptorq: upper matrix entries overflow")
 	}
 
-	cols := l.ColsNum() - pi
-	rows := l.RowsNum()
+	cols := lCols - pi
+	rows := lRows
 
 	dec := inactivateDecoder{
-		cols:         cols,
-		rows:         rows,
-		wasRow:       arena.newBool(int(rows)),
-		wasCol:       arena.newBool(int(cols)),
-		colCnt:       arena.newU32(int(cols)),
-		rowCnt:       arena.newU32(int(rows)),
-		rowXor:       arena.newU32(int(rows)),
-		pRows:        arena.newU32(int(rows + pi))[:0],
-		pCols:        arena.newU32(int(cols + pi))[:0],
-		inactiveCols: arena.newU32(int(cols))[:0],
+		cols:   cols,
+		rows:   rows,
+		wasRow: arena.newBool(int(rows)),
+		wasCol: arena.newBool(int(cols)),
+		colCnt: arena.newU32(int(cols)),
+		rowCnt: arena.newU32(int(rows)),
+		rowXor: arena.newU32(int(rows)),
+		// append targets, written before any read
+		pRows:        arena.newU32Dirty(int(rows + pi))[:0],
+		pCols:        arena.newU32Dirty(int(cols + pi))[:0],
+		inactiveCols: arena.newU32Dirty(int(cols))[:0],
 	}
 
 	dec.indexFromEntries(arena, entries)
@@ -61,71 +60,80 @@ func inactivateDecode(arena *matrixArena, l *discmath.MatrixGF256, pi uint32, en
 		dec.inactiveCols[i], dec.inactiveCols[j] = dec.inactiveCols[j], dec.inactiveCols[i]
 	}
 
-	for _, col := range dec.inactiveCols {
-		dec.pCols = append(dec.pCols, col)
-	}
+	dec.pCols = append(dec.pCols, dec.inactiveCols...)
 
+	n := len(dec.pCols)
+	dec.pCols = dec.pCols[:n+int(pi)]
 	for i := uint32(0); i < pi; i++ {
-		dec.pCols = append(dec.pCols, dec.cols+i)
+		dec.pCols[n+int(i)] = dec.cols + i
 	}
 
 	return side, dec.pRows, dec.pCols
 }
 
 func (dec *inactivateDecoder) indexFromEntries(arena *matrixArena, entries upperMatrixEntries) {
-	nonZero := uint32(0)
-	for i := uint32(0); i < entries.n; i++ {
-		row := entries.rows[i]
-		col := entries.cols[i]
-		if row >= dec.rows || col >= dec.cols {
+	eRows := entries.rows[:entries.n]
+	eCols := entries.cols[:entries.n]
+
+	rowCnt := dec.rowCnt
+	colCnt := dec.colCnt
+	rowXor := dec.rowXor[:len(rowCnt)]
+	for i, row := range eRows {
+		col := eCols[i]
+		r, c := int(row), int(col)
+		if r >= len(rowCnt) || c >= len(colCnt) {
 			continue
 		}
 
-		dec.colCnt[col]++
-		dec.rowCnt[row]++
-		dec.rowXor[row] ^= col
-		nonZero++
+		colCnt[c]++
+		rowCnt[r]++
+		rowXor[r] ^= col
 	}
 
-	dec.rowStarts = arena.newU32(int(dec.rows + 1))
-	dec.colStarts = arena.newU32(int(dec.cols + 1))
+	// starts are fully written by the prefix sums, cols/rows arrays by the
+	// cursor scatter below, so all can start dirty
+	dec.rowStarts = arena.newU32Dirty(int(dec.rows + 1))
+	dec.colStarts = arena.newU32Dirty(int(dec.cols + 1))
 
 	offset := uint32(0)
 	for row := uint32(0); row < dec.rows; row++ {
 		dec.rowStarts[row] = offset
-		offset += dec.rowCnt[row]
+		offset += rowCnt[row]
 	}
 	dec.rowStarts[dec.rows] = offset
+	nonZero := offset
 
 	offset = 0
 	for col := uint32(0); col < dec.cols; col++ {
 		dec.colStarts[col] = offset
-		offset += dec.colCnt[col]
+		offset += colCnt[col]
 	}
 	dec.colStarts[dec.cols] = offset
 
-	dec.rowCols = arena.newU32(int(nonZero))
-	dec.colRows = arena.newU32(int(nonZero))
+	dec.rowCols = arena.newU32Dirty(int(nonZero))
+	dec.colRows = arena.newU32Dirty(int(nonZero))
 
-	rowCursor := arena.newU32(int(dec.rows))
-	colCursor := arena.newU32(int(dec.cols))
+	rowCursor := arena.newU32Dirty(int(dec.rows))
+	colCursor := arena.newU32Dirty(int(dec.cols))
 	copy(rowCursor, dec.rowStarts[:dec.rows])
 	copy(colCursor, dec.colStarts[:dec.cols])
 
-	for i := uint32(0); i < entries.n; i++ {
-		row := entries.rows[i]
-		col := entries.cols[i]
-		if row >= dec.rows || col >= dec.cols {
+	rowCols := dec.rowCols
+	colRows := dec.colRows
+	for i, row := range eRows {
+		col := eCols[i]
+		r, c := int(row), int(col)
+		if r >= len(rowCursor) || c >= len(colCursor) {
 			continue
 		}
 
-		rowPos := rowCursor[row]
-		dec.rowCols[rowPos] = col
-		rowCursor[row]++
+		rowPos := rowCursor[r]
+		rowCols[rowPos] = col
+		rowCursor[r] = rowPos + 1
 
-		colPos := colCursor[col]
-		dec.colRows[colPos] = row
-		colCursor[col]++
+		colPos := colCursor[c]
+		colRows[colPos] = row
+		colCursor[c] = colPos + 1
 	}
 }
 
@@ -138,21 +146,33 @@ func (dec *inactivateDecoder) columnRows(col uint32) []uint32 {
 }
 
 func (dec *inactivateDecoder) sort(arena *matrixArena) {
-	offset := arena.newU32(int(dec.cols + 2))
-	for i := uint32(0); i < dec.rows; i++ {
-		offset[dec.rowCnt[i]+1]++
+	// the counting-sort histogram only needs maxCnt+2 buckets, row degrees
+	// are far below cols; rowCntOffset entries above maxCnt are never read
+	// since row counts only decrease
+	rowCnt := dec.rowCnt
+	maxCnt := uint32(0)
+	for _, c := range rowCnt {
+		if c > maxCnt {
+			maxCnt = c
+		}
 	}
-	for i := uint32(1); i <= dec.cols+1; i++ {
+
+	offset := arena.newU32(int(maxCnt) + 2)
+	for _, c := range rowCnt {
+		offset[c+1]++
+	}
+	for i := uint32(1); i <= maxCnt+1; i++ {
 		offset[i] += offset[i-1]
 	}
-	dec.rowCntOffset = arena.newU32(int(dec.rows))
+	dec.rowCntOffset = arena.newU32Dirty(int(dec.rows))
 	copy(dec.rowCntOffset, offset)
 
-	dec.sortedRows = arena.newU32(int(dec.rows))
-	dec.rowPos = arena.newU32(int(dec.rows))
+	// placement fully writes both arrays: bucket cursors tile [0, rows)
+	dec.sortedRows = arena.newU32Dirty(int(dec.rows))
+	dec.rowPos = arena.newU32Dirty(int(dec.rows))
 	for i := uint32(0); i < dec.rows; i++ {
-		pos := offset[dec.rowCnt[i]]
-		offset[dec.rowCnt[i]]++
+		pos := offset[rowCnt[i]]
+		offset[rowCnt[i]]++
 
 		dec.sortedRows[pos] = i
 		dec.rowPos[i] = pos
@@ -160,12 +180,14 @@ func (dec *inactivateDecoder) sort(arena *matrixArena) {
 }
 
 func (dec *inactivateDecoder) loop(arena *matrixArena) {
-	// loop
-	for dec.rowCntOffset[1] != dec.rows {
-		row := dec.sortedRows[dec.rowCntOffset[1]]
+	rowCntOffset, sortedRows, rowCnt := dec.rowCntOffset, dec.sortedRows, dec.rowCnt
+	wasCol, wasRow := dec.wasCol, dec.wasRow
+
+	for rowCntOffset[1] != dec.rows {
+		row := sortedRows[rowCntOffset[1]]
 		col := dec.chooseCol(row)
 
-		cnt := dec.rowCnt[row]
+		cnt := rowCnt[row]
 		dec.pCols = append(dec.pCols, col)
 		dec.pRows = append(dec.pRows, row)
 
@@ -173,7 +195,7 @@ func (dec *inactivateDecoder) loop(arena *matrixArena) {
 			dec.inactivate(col)
 		} else {
 			for _, x := range dec.rowColumns(row) {
-				if dec.wasCol[x] {
+				if wasCol[x] {
 					continue
 				}
 				if x != col {
@@ -182,7 +204,7 @@ func (dec *inactivateDecoder) loop(arena *matrixArena) {
 				dec.inactivate(x)
 			}
 		}
-		dec.wasRow[row] = true
+		wasRow[row] = true
 	}
 }
 
@@ -193,12 +215,15 @@ func (dec *inactivateDecoder) chooseCol(row uint32) uint32 {
 	}
 
 	bestCol := uint32(0xFFFFFFFF)
+	bestCnt := uint32(0)
+	wasCol, colCnt := dec.wasCol, dec.colCnt
 	for _, col := range dec.rowColumns(row) {
-		if dec.wasCol[col] {
+		if wasCol[col] {
 			continue
 		}
-		if bestCol == 0xFFFFFFFF || dec.colCnt[col] < dec.colCnt[bestCol] {
-			bestCol = col
+		c := colCnt[col]
+		if bestCol == 0xFFFFFFFF || c < bestCnt {
+			bestCol, bestCnt = col, c
 		}
 	}
 	return bestCol
@@ -206,20 +231,26 @@ func (dec *inactivateDecoder) chooseCol(row uint32) uint32 {
 
 func (dec *inactivateDecoder) inactivate(col uint32) {
 	dec.wasCol[col] = true
+
+	wasRow, rowPos, rowCnt := dec.wasRow, dec.rowPos, dec.rowCnt
+	rowCntOffset, sortedRows, rowXor := dec.rowCntOffset, dec.sortedRows, dec.rowXor
 	for _, row := range dec.columnRows(col) {
-		if dec.wasRow[row] {
+		if wasRow[row] {
 			continue
 		}
 
-		pos := dec.rowPos[row]
-		cnt := dec.rowCnt[row]
-		offset := dec.rowCntOffset[cnt]
-		dec.sortedRows[pos], dec.sortedRows[offset] = dec.sortedRows[offset], dec.sortedRows[pos]
-
-		dec.rowPos[dec.sortedRows[pos]] = pos
-		dec.rowPos[dec.sortedRows[offset]] = offset
-		dec.rowCntOffset[cnt]++
-		dec.rowCnt[row]--
-		dec.rowXor[row] ^= col
+		// sortedRows[rowPos[row]] == row (inverse permutation invariant),
+		// so the swap needs a single load of the other slot
+		pos := rowPos[row]
+		cnt := rowCnt[row]
+		offset := rowCntOffset[cnt]
+		other := sortedRows[offset]
+		sortedRows[offset] = row
+		sortedRows[pos] = other
+		rowPos[other] = pos
+		rowPos[row] = offset
+		rowCntOffset[cnt] = offset + 1
+		rowCnt[row] = cnt - 1
+		rowXor[row] ^= col
 	}
 }

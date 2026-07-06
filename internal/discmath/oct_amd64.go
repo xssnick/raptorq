@@ -1,4 +1,4 @@
-//go:build amd64
+//go:build amd64 && !purego
 
 package discmath
 
@@ -97,19 +97,21 @@ func OctVecMul(vector []byte, multiplier uint8) {
 		return
 	}
 
-	table4 := _Mul4bitPreCalc[multiplier]
 	blocks := n / 16
 	if blocks > 0 {
 		asmSSSE3Mul(
 			unsafe.Pointer(&vector[0]),
-			unsafe.Pointer(&table4[0]),
+			unsafe.Pointer(&_Mul4bitPreCalc[multiplier][0]),
 			blocks,
 		)
 	}
 
-	table := _MulPreCalc[multiplier]
-	for i := blocks * 16; i < n; i++ {
-		vector[i] = table[vector[i]]
+	if i := blocks * 16; i < n {
+		// pointer into the read-only global, a value copy would memmove 256B
+		table := &_MulPreCalc[multiplier]
+		for ; i < n; i++ {
+			vector[i] = table[vector[i]]
+		}
 	}
 }
 
@@ -118,18 +120,19 @@ func OctVecMulAdd(x, y []byte, multiplier uint8) {
 	if n == 0 {
 		return
 	}
-	table := _Mul4bitPreCalc[multiplier]
 	blocks := n / 16
 	if blocks > 0 {
 		asmSSSE3MulAdd(
 			unsafe.Pointer(&x[0]),
 			unsafe.Pointer(&y[0]),
-			unsafe.Pointer(&table[0]),
+			unsafe.Pointer(&_Mul4bitPreCalc[multiplier][0]),
 			blocks,
 		)
 	}
-	full := _MulPreCalc[multiplier]
-	for i := blocks * 16; i < n; i++ {
-		x[i] ^= full[y[i]]
+	if i := blocks * 16; i < n {
+		full := &_MulPreCalc[multiplier]
+		for ; i < n; i++ {
+			x[i] ^= full[y[i]]
+		}
 	}
 }

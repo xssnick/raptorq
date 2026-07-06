@@ -10,7 +10,7 @@ import (
 func TestOctVecAdd(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
 
-	sizes := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 14, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 768, 4096}
+	sizes := []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 14, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 768, 4096}
 
 	for _, n := range sizes {
 		for iter := 0; iter < 3; iter++ {
@@ -66,7 +66,7 @@ func octVecMul_generic(vector []byte, multiplier uint8) {
 
 func TestOctVecMul_BasicSizes(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
-	sizes := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 14, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 768, 4096}
+	sizes := []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 14, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 768, 4096}
 	mults := []byte{0x00, 0x01, 0x02, 0x03, 0x1b, 0x53, 0x80, 0x8d, 0xff} // набор репрезентативных множителей
 
 	for _, n := range sizes {
@@ -188,7 +188,7 @@ func OctVecMulAdd_generic(x, y []byte, multiplier byte) {
 func TestOctVecMulAdd(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
 	sizes := []int{
-		1, 2, 3, 4, 5, 6, 7, 8, 9,
+		0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
 		14, 15, 16, 17,
 		31, 32, 33,
 		63, 64, 65,
@@ -265,5 +265,55 @@ func TestOctVecMulAdd(t *testing.T) {
 	OctVecMulAdd(x, y, m)
 	if !bytes.Equal(x, want) {
 		t.Fatalf("smoke mismatch (n=%d, m=0x%02x)", n, m)
+	}
+}
+
+// Exhaustive differential test over every length crossing all vector-loop
+// tier boundaries (128/64/32/16 and byte tails).
+func TestOctVec_AllLengths(t *testing.T) {
+	rng := rand.New(rand.NewSource(42))
+
+	for n := 0; n <= 300; n++ {
+		x := make([]byte, n)
+		y := make([]byte, n)
+		for i := 0; i < n; i++ {
+			x[i] = byte(rng.Intn(256))
+			y[i] = byte(rng.Intn(256))
+		}
+
+		for _, mul := range []uint8{0, 1, 2, 3, 91, 254, 255} {
+			// OctVecAdd
+			gotA := append([]byte(nil), x...)
+			wantA := make([]byte, n)
+			for i := 0; i < n; i++ {
+				wantA[i] = x[i] ^ y[i]
+			}
+			OctVecAdd(gotA, y)
+			if !bytes.Equal(gotA, wantA) {
+				t.Fatalf("OctVecAdd mismatch n=%d", n)
+			}
+
+			// OctVecMul
+			gotM := append([]byte(nil), x...)
+			wantM := make([]byte, n)
+			for i := 0; i < n; i++ {
+				wantM[i] = OctMul(x[i], mul)
+			}
+			OctVecMul(gotM, mul)
+			if !bytes.Equal(gotM, wantM) {
+				t.Fatalf("OctVecMul mismatch n=%d mul=%d", n, mul)
+			}
+
+			// OctVecMulAdd
+			gotMA := append([]byte(nil), x...)
+			wantMA := make([]byte, n)
+			for i := 0; i < n; i++ {
+				wantMA[i] = x[i] ^ OctMul(y[i], mul)
+			}
+			OctVecMulAdd(gotMA, y, mul)
+			if !bytes.Equal(gotMA, wantMA) {
+				t.Fatalf("OctVecMulAdd mismatch n=%d mul=%d", n, mul)
+			}
+		}
 	}
 }

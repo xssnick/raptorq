@@ -52,6 +52,11 @@ func (m *MatrixGF256) RowSet(row uint32, r []uint8) {
 }
 
 func (m *MatrixGF256) SetFrom(g *MatrixGF256, rowOffset, colOffset uint32) {
+	if colOffset == 0 && g.Cols == m.Cols {
+		// rows are contiguous, one flat copy
+		copy(m.Data[rowOffset*m.Cols:], g.Data)
+		return
+	}
 	for r := uint32(0); r < g.Rows; r++ {
 		copy(m.GetRow(rowOffset + r)[colOffset:], g.GetRow(r))
 	}
@@ -144,6 +149,11 @@ func (m *MatrixGF256) MulSparse(s *MatrixGF256) *MatrixGF256 {
 }
 
 func (m *MatrixGF256) Add(s *MatrixGF256) *MatrixGF256 {
+	if s.Cols == m.Cols {
+		// rows are contiguous, one flat XOR pass
+		OctVecAdd(m.Data[:s.Rows*s.Cols], s.Data)
+		return m
+	}
 	for i := uint32(0); i < s.RowsNum(); i++ {
 		m.RowAdd(i, s.GetRow(i))
 	}

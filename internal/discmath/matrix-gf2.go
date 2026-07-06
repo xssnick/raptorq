@@ -1,6 +1,7 @@
 package discmath
 
 import (
+	"encoding/binary"
 	"fmt"
 	"strings"
 )
@@ -74,10 +75,8 @@ func (m *PlainMatrixGF2) GetRow(row uint32) []byte {
 }
 
 func (m *PlainMatrixGF2) RowAdd(row uint32, what []byte) {
-	firstElIdx, _ := m.getElementPosition(row, 0)
-	for i, whatByte := range what {
-		m.data[firstElIdx+uint32(i)] ^= whatByte
-	}
+	firstElIdx := row * m.rowSize
+	OctVecAdd(m.data[firstElIdx:firstElIdx+uint32(len(what))], what)
 }
 
 func (m *PlainMatrixGF2) Mul(s *MatrixGF256) *PlainMatrixGF2 {
@@ -85,16 +84,14 @@ func (m *PlainMatrixGF2) Mul(s *MatrixGF256) *PlainMatrixGF2 {
 	return m.MulTo(s, mg)
 }
 
+// MulTo accumulates into mg, which must be zeroed (both callers pass
+// freshly initialized matrices, InitPlainMatrixGF2 already clears)
 func (m *PlainMatrixGF2) MulTo(s *MatrixGF256, mg *PlainMatrixGF2) *PlainMatrixGF2 {
-	clear(mg.data)
-
-	for i, val := range s.Data {
-		if val != 0 {
-			row := uint32(i) / s.Cols
-			col := uint32(i) % s.Cols
-
-			mRow := m.GetRow(col)
-			mg.RowAdd(row, mRow)
+	for row := uint32(0); row < s.Rows; row++ {
+		for col, val := range s.GetRow(row) {
+			if val != 0 {
+				mg.RowAdd(row, m.GetRow(uint32(col)))
+			}
 		}
 	}
 
@@ -129,13 +126,36 @@ func (m *PlainMatrixGF2) String() string {
 	return strings.Join(rows, "\n")
 }
 
+// _BitExpand maps a bit-packed byte to 8 result bytes (0 or 1 each),
+// bit i of the input becomes byte i of the little-endian uint64.
+var _BitExpand = calcBitExpand()
+
+func calcBitExpand() [256]uint64 {
+	var t [256]uint64
+	for b := 0; b < 256; b++ {
+		var v uint64
+		for bit := 0; bit < 8; bit++ {
+			if b&(1<<bit) != 0 {
+				v |= 1 << (8 * bit)
+			}
+		}
+		t[b] = v
+	}
+	return t
+}
+
 func (m *PlainMatrixGF2) RowToGF256(row uint32, dst []byte) {
 	dst = dst[:m.cols]
-	clear(dst)
+	rowData := m.GetRow(row)
 
-	col := uint32(0)
-	for _, b := range m.GetRow(row) {
-		for bit := byte(0); bit < elSize && col < m.cols; bit++ {
+	full := int(m.cols / elSize)
+	for i := 0; i < full; i++ {
+		binary.LittleEndian.PutUint64(dst[i*elSize:], _BitExpand[rowData[i]])
+	}
+
+	if col := uint32(full * elSize); col < m.cols {
+		b := rowData[full]
+		for bit := byte(0); col < m.cols; bit++ {
 			dst[col] = (b >> bit) & 1
 			col++
 		}

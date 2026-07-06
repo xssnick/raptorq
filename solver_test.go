@@ -159,7 +159,7 @@ func Test_EncodeDecodeFuzz(t *testing.T) {
 	}
 }
 
-// Benchmark_EncodeDecodeFuzz-10    	                        5732	    182353 ns/op	  364865 B/op	     203 allocs/op
+// Benchmark_EncodeDecodeFuzz-10    	   32475	     37316 ns/op	   50505 B/op	      20 allocs/op
 func Benchmark_EncodeDecodeFuzz(b *testing.B) {
 	str := make([]byte, 4096)
 	rand.Read(str)
@@ -197,6 +197,75 @@ func Benchmark_EncodeDecodeFuzz(b *testing.B) {
 		if err != nil {
 			b.Fatal("decode err", err)
 		}
+	}
+}
+
+func Test_DecodeIntoReuse(t *testing.T) {
+	// data size is not a multiple of the symbol size to exercise the tail symbol path
+	str := make([]byte, 100000)
+	_, _ = rand.Read(str)
+
+	r := NewRaptorQ(768)
+	enc, err := r.CreateEncoder(str)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := enc.params._K
+
+	dec, err := r.CreateDecoder(uint32(len(str)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err = dec.DecodeInto(make([]byte, len(str)-1)); err == nil {
+		t.Fatal("expected error for short dst")
+	}
+
+	dst := make([]byte, len(str))
+	for round := uint32(0); round < 4; round++ {
+		dec.Reset()
+
+		// drop every (round+2)-th fast symbol, cover the loss with repair symbols
+		dropped := uint32(0)
+		for i := uint32(0); i < k; i++ {
+			if i%(round+2) == 0 {
+				dropped++
+				continue
+			}
+			if _, err = dec.AddSymbol(i, enc.GenSymbol(i)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for i := uint32(0); i < dropped+5; i++ {
+			id := k + round*10000 + i
+			if _, err = dec.AddSymbol(id, enc.GenSymbol(id)); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		clear(dst)
+		ok, err := dec.DecodeInto(dst)
+		if err != nil {
+			t.Fatal("round", round, err)
+		}
+		if !ok {
+			t.Fatal("round", round, "not decoded")
+		}
+		if !bytes.Equal(dst, str) {
+			t.Fatal("round", round, "decoded data mismatch")
+		}
+	}
+
+	// reused decoder must also work with the allocating Decode and full fast path
+	dec.Reset()
+	for i := uint32(0); i < k; i++ {
+		if _, err = dec.AddSymbol(i, enc.GenSymbol(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ok, data, err := dec.Decode()
+	if err != nil || !ok || !bytes.Equal(data, str) {
+		t.Fatal("full fast path after reset failed", ok, err)
 	}
 }
 
@@ -269,6 +338,83 @@ func Benchmark_Decode80PercentFastRecovery(b *testing.B) {
 
 	for n := 0; n < b.N; n++ {
 		if _, err = decode(); err != nil {
+			b.Fatal("decode err", err)
+		}
+	}
+}
+
+// Same as Benchmark_Decode80PercentFastRecovery, but the decoder and the
+// output buffer are reused via Reset + DecodeInto.
+func Benchmark_Decode80PercentFastRecoveryReuse(b *testing.B) {
+	str := make([]byte, 1<<20)
+	rand.Read(str)
+
+	const symSz uint32 = 768
+	r := NewRaptorQ(symSz)
+	enc, err := r.CreateEncoder(str)
+	if err != nil {
+		b.Fatal("create encoder err", err)
+	}
+
+	k := enc.params._K
+	fastNum := (k*80 + 99) / 100
+	if fastNum >= k {
+		fastNum = k - 1
+	}
+	recoverNum := k - fastNum
+
+	fastSymbols := make([][]byte, fastNum)
+	for i := uint32(0); i < fastNum; i++ {
+		fastSymbols[i] = enc.GenSymbol(i)
+	}
+
+	repairSymbols := make([][]byte, recoverNum)
+	for i := uint32(0); i < recoverNum; i++ {
+		repairSymbols[i] = enc.GenSymbol(k + i)
+	}
+
+	dec, err := r.CreateDecoder(uint32(len(str)))
+	if err != nil {
+		b.Fatal("create decoder err", err)
+	}
+	dst := make([]byte, len(str))
+
+	decode := func() error {
+		dec.Reset()
+		for i := uint32(0); i < fastNum; i++ {
+			if _, err := dec.AddSymbol(i, fastSymbols[i]); err != nil {
+				return err
+			}
+		}
+		for i := uint32(0); i < recoverNum; i++ {
+			if _, err := dec.AddSymbol(k+i, repairSymbols[i]); err != nil {
+				return err
+			}
+		}
+
+		ok, err := dec.DecodeInto(dst)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errNotEnoughSymbols
+		}
+		return nil
+	}
+
+	if err = decode(); err != nil {
+		b.Fatal("decode err", err)
+	}
+	if !bytes.Equal(dst, str) {
+		b.Fatal("initial data not eq decoded")
+	}
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(str)))
+	b.ResetTimer()
+
+	for n := 0; n < b.N; n++ {
+		if err = decode(); err != nil {
 			b.Fatal("decode err", err)
 		}
 	}
