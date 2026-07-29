@@ -2,49 +2,56 @@
 
 package discmath
 
-import "unsafe"
+import "encoding/binary"
 
 func OctVecAdd(x, y []byte) {
 	n := len(x)
-	xUint64 := *(*[]uint64)(unsafe.Pointer(&x))
-	yUint64 := *(*[]uint64)(unsafe.Pointer(&y))
+	y = y[:n] // lifts the bounds checks on y out of the loops
 
-	for i := 0; i < n/8; i++ {
-		xUint64[i] ^= yUint64[i]
+	i := 0
+	// XOR is byte-wise, only the two sides have to agree on the word order,
+	for ; i+8 <= n; i += 8 {
+		a, b := x[i:i+8], y[i:i+8]
+		binary.NativeEndian.PutUint64(a, binary.NativeEndian.Uint64(a)^binary.NativeEndian.Uint64(b))
 	}
 
-	for i := n - n%8; i < n; i++ {
+	for ; i < n; i++ {
 		x[i] ^= y[i]
 	}
 }
 
 func OctVecMul(vector []byte, multiplier uint8) {
-	for i := 0; i < len(vector); i++ {
-		vector[i] = OctMul(vector[i], multiplier)
+	// pointer into the read-only global, a value copy would memmove 256B
+	table := &_MulPreCalc[multiplier]
+	for i, v := range vector {
+		vector[i] = table[v]
 	}
 }
 
 func OctVecMulAdd(x, y []byte, multiplier uint8) {
 	n := len(x)
-	table := _MulPreCalc[multiplier]
-	xUint64 := *(*[]uint64)(unsafe.Pointer(&x))
-	pos := 0
-	for i := 0; i < n/8; i++ {
-		var prod uint64
-		prod |= uint64(table[y[pos]])
-		prod |= uint64(table[y[pos+1]]) << 8
-		prod |= uint64(table[y[pos+2]]) << 16
-		prod |= uint64(table[y[pos+3]]) << 24
-		prod |= uint64(table[y[pos+4]]) << 32
-		prod |= uint64(table[y[pos+5]]) << 40
-		prod |= uint64(table[y[pos+6]]) << 48
-		prod |= uint64(table[y[pos+7]]) << 56
+	table := &_MulPreCalc[multiplier]
+	y = y[:n]
 
-		pos += 8
-		xUint64[i] ^= prod
+	i := 0
+	// lane k of prod holds table[y[i+k]], so x is read and written
+	// little-endian to keep lane k lined up with byte i+k everywhere
+	for ; i+8 <= n; i += 8 {
+		b := y[i : i+8]
+		prod := uint64(table[b[0]]) |
+			uint64(table[b[1]])<<8 |
+			uint64(table[b[2]])<<16 |
+			uint64(table[b[3]])<<24 |
+			uint64(table[b[4]])<<32 |
+			uint64(table[b[5]])<<40 |
+			uint64(table[b[6]])<<48 |
+			uint64(table[b[7]])<<56
+
+		a := x[i : i+8]
+		binary.LittleEndian.PutUint64(a, binary.LittleEndian.Uint64(a)^prod)
 	}
 
-	for i := n - n%8; i < n; i++ {
+	for ; i < n; i++ {
 		x[i] ^= table[y[i]]
 	}
 }
