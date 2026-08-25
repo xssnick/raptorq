@@ -1,5 +1,31 @@
 package raptorq
 
+import "sync/atomic"
+
+// zeroPad backs the all-zero padding symbols the decoder feeds to solve. solve
+// only ever reads symbol payloads out (see createDPermuted), so a single
+// read-only buffer can back every padding entry of every decoder. It grows to
+// the largest symbol size in use and never further, so unlike a cache keyed by
+// data size it is bounded by the symbol size alone.
+var zeroPad atomic.Pointer[[]byte]
+
+func zeroSymbol(size uint32) []byte {
+	if cur := zeroPad.Load(); cur != nil && uint32(len(*cur)) >= size {
+		return (*cur)[:size]
+	}
+
+	grown := make([]byte, size)
+	for {
+		cur := zeroPad.Load()
+		if cur != nil && uint32(len(*cur)) >= size {
+			return (*cur)[:size]
+		}
+		if zeroPad.CompareAndSwap(cur, &grown) {
+			return grown
+		}
+	}
+}
+
 type symbol struct {
 	ID   uint32
 	Data []byte

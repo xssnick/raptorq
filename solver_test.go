@@ -139,7 +139,7 @@ func Test_EncodeDecodeFuzz(t *testing.T) {
 			t.Fatal("add 2 symbol err", err)
 		}
 
-		for i := uint32(0); i < enc.params._K; i++ {
+		for i := uint32(0); i < enc.k; i++ {
 			sx := enc.GenSymbol(i + 10000)
 
 			_, err := dec.AddSymbol(i+10000, sx)
@@ -184,7 +184,7 @@ func Benchmark_EncodeDecodeFuzz(b *testing.B) {
 			b.Fatal("add 2 symbol err", err)
 		}
 
-		for i := uint32(0); i < enc.params._K; i++ {
+		for i := uint32(0); i < enc.k; i++ {
 			sx := enc.GenSymbol(i + 10000)
 
 			_, err := dec.AddSymbol(i+10000, sx)
@@ -210,7 +210,7 @@ func Test_DecodeIntoReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	k := enc.params._K
+	k := enc.k
 
 	dec, err := r.CreateDecoder(uint32(len(str)))
 	if err != nil {
@@ -280,7 +280,7 @@ func Benchmark_Decode80PercentFastRecovery(b *testing.B) {
 		b.Fatal("create encoder err", err)
 	}
 
-	k := enc.params._K
+	k := enc.k
 	fastNum := (k*80 + 99) / 100
 	if fastNum >= k {
 		fastNum = k - 1
@@ -356,7 +356,7 @@ func Benchmark_Decode80PercentFastRecoveryReuse(b *testing.B) {
 		b.Fatal("create encoder err", err)
 	}
 
-	k := enc.params._K
+	k := enc.k
 	fastNum := (k*80 + 99) / 100
 	if fastNum >= k {
 		fastNum = k - 1

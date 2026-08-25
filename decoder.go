@@ -10,6 +10,7 @@ import (
 type Decoder struct {
 	symbolSz uint32
 	dataSz   uint32
+	k        uint32
 
 	fastNum uint32
 	slowNum uint32
@@ -68,7 +69,7 @@ func putSymbolSlice(s []symbol) {
 }
 
 func (r *RaptorQ) CreateDecoder(dataSize uint32) (*Decoder, error) {
-	param, err := r.calcParams(dataSize)
+	param, k, err := r.calcParams(dataSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to calc params: %w", err)
 	}
@@ -77,8 +78,9 @@ func (r *RaptorQ) CreateDecoder(dataSize uint32) (*Decoder, error) {
 		symbolSz:    r.symbolSz,
 		pm:          param,
 		dataSz:      dataSize,
-		fastSeen:    make([]bool, param._K),
-		fastSymbols: make([]byte, param._K*r.symbolSz),
+		k:           k,
+		fastSeen:    make([]bool, k),
+		fastSymbols: make([]byte, k*r.symbolSz),
 	}, nil
 }
 
@@ -87,9 +89,9 @@ func (d *Decoder) AddSymbol(id uint32, data []byte) (bool, error) {
 		return false, fmt.Errorf("incorrect symbol size %d, should be %d", len(data), d.symbolSz)
 	}
 
-	if id < d.pm._K {
+	if id < d.k {
 		if d.fastSeen[id] {
-			return d.fastNum+d.slowNum >= d.pm._K, nil
+			return d.fastNum+d.slowNum >= d.k, nil
 		}
 		copy(d.fastSymbol(id), data)
 		d.fastSeen[id] = true
@@ -97,12 +99,12 @@ func (d *Decoder) AddSymbol(id uint32, data []byte) (bool, error) {
 	} else {
 		if d.slowIndex != nil {
 			if _, ok := d.slowIndex[id]; ok {
-				return d.fastNum+d.slowNum >= d.pm._K, nil
+				return d.fastNum+d.slowNum >= d.k, nil
 			}
 		} else {
 			for _, slowID := range d.slowIDs {
 				if slowID == id {
-					return d.fastNum+d.slowNum >= d.pm._K, nil
+					return d.fastNum+d.slowNum >= d.k, nil
 				}
 			}
 
@@ -116,7 +118,7 @@ func (d *Decoder) AddSymbol(id uint32, data []byte) (bool, error) {
 		}
 
 		if d.slowSymbols == nil {
-			capSymbols := d.pm._K - d.fastNum + 1
+			capSymbols := d.k - d.fastNum + 1
 			if capSymbols == 0 {
 				capSymbols = 1
 			}
@@ -134,25 +136,25 @@ func (d *Decoder) AddSymbol(id uint32, data []byte) (bool, error) {
 		d.slowNum++
 	}
 
-	return d.fastNum+d.slowNum >= d.pm._K, nil
+	return d.fastNum+d.slowNum >= d.k, nil
 }
 
 func (d *Decoder) FastSymbolsNumRequired() uint32 {
-	return d.pm._K
+	return d.k
 }
 
 func (d *Decoder) Decode() (bool, []byte, error) {
-	if d.fastNum+d.slowNum < d.pm._K {
+	if d.fastNum+d.slowNum < d.k {
 		return false, nil, fmt.Errorf("not enough symbols to decode")
 	}
 
-	if d.fastNum == d.pm._K {
+	if d.fastNum == d.k {
 		out := make([]byte, d.dataSz)
 		copy(out, d.fastSymbols)
 		return true, out, nil
 	}
 
-	out := make([]byte, d.pm._K*d.symbolSz)
+	out := make([]byte, d.k*d.symbolSz)
 	ok, err := d.decodeInto(out)
 	if !ok || err != nil {
 		return false, nil, err
@@ -170,11 +172,11 @@ func (d *Decoder) DecodeInto(dst []byte) (bool, error) {
 	}
 	dst = dst[:d.dataSz]
 
-	if d.fastNum+d.slowNum < d.pm._K {
+	if d.fastNum+d.slowNum < d.k {
 		return false, fmt.Errorf("not enough symbols to decode")
 	}
 
-	if d.fastNum == d.pm._K {
+	if d.fastNum == d.k {
 		copy(dst, d.fastSymbols[:d.dataSz])
 		return true, nil
 	}
@@ -186,7 +188,7 @@ func (d *Decoder) DecodeInto(dst []byte) (bool, error) {
 // a possibly truncated last symbol is handled through a temporary buffer.
 func (d *Decoder) decodeInto(out []byte) (bool, error) {
 	// Build system for Solve from known symbols (no payload copy).
-	sz := d.pm._K + d.slowNum
+	sz := d.k + d.slowNum
 	if sz < d.pm._KPadded {
 		sz = d.pm._KPadded
 	}
@@ -196,7 +198,7 @@ func (d *Decoder) decodeInto(out []byte) (bool, error) {
 	}()
 
 	// add known symbols
-	for i := uint32(0); i < d.pm._K; i++ {
+	for i := uint32(0); i < d.k; i++ {
 		if d.fastSeen[i] {
 			toRelax = append(toRelax, symbol{ID: i, Data: d.fastSymbol(i)})
 		}
@@ -204,19 +206,22 @@ func (d *Decoder) decodeInto(out []byte) (bool, error) {
 
 	for i, slowID := range d.slowIDs {
 		k := slowID
-		if k >= d.pm._K {
+		if k >= d.k {
 			// add offset for additional symbols
-			k = k + d.pm._KPadded - d.pm._K
+			k = k + d.pm._KPadded - d.k
 		}
 		toRelax = append(toRelax, symbol{ID: k, Data: d.slowSymbol(uint32(i) * d.symbolSz)})
 	}
 
 	// add padding empty symbols
-	for i := uint32(len(toRelax)); i < d.pm._KPadded; i++ {
-		toRelax = append(toRelax, symbol{
-			ID:   i,
-			Data: d.pm.zeroSymbol,
-		})
+	if uint32(len(toRelax)) < d.pm._KPadded {
+		zero := zeroSymbol(d.symbolSz)
+		for i := uint32(len(toRelax)); i < d.pm._KPadded; i++ {
+			toRelax = append(toRelax, symbol{
+				ID:   i,
+				Data: zero,
+			})
+		}
 	}
 
 	// we have not all fast symbols, try to recover them from slow
@@ -229,12 +234,12 @@ func (d *Decoder) decodeInto(out []byte) (bool, error) {
 	}
 	defer release()
 
-	for i := uint32(0); i < d.pm._K; {
+	for i := uint32(0); i < d.k; {
 		if d.fastSeen[i] {
 			// coalesce a run of consecutive fast symbols into one copy,
 			// fastSymbols has the same layout as out
 			start := i
-			for i < d.pm._K && d.fastSeen[i] {
+			for i < d.k && d.fastSeen[i] {
 				i++
 			}
 			off := start * d.symbolSz

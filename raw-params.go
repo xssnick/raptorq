@@ -10,15 +10,26 @@ type RawParams struct {
 	W       uint32
 }
 
-type rawParams = RawParams
+var errKTooBig = errors.New("k is too big")
 
-func calcRawParams(K uint32) (*rawParams, error) {
-	for i := range ParamsTable {
-		if ParamsTable[i].KPadded >= K {
-			return &ParamsTable[i], nil
+// rawParamsIndex returns the index of the first ParamsTable row that holds at
+// least K symbols, or -1 when K is past the end of the table. KPadded is
+// strictly ascending, which Test_ParamsTableInvariants guards, so this is a
+// binary search.
+func rawParamsIndex(K uint32) int {
+	lo, hi := 0, len(ParamsTable)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if ParamsTable[mid].KPadded < K {
+			lo = mid + 1
+		} else {
+			hi = mid
 		}
 	}
-	return nil, errors.New("k is too big")
+	if lo == len(ParamsTable) {
+		return -1
+	}
+	return lo
 }
 
 var ParamsTable = []RawParams{{10, 254, 7, 10, 17}, {12, 630, 7, 10, 19}, {18, 682, 11, 10, 29},

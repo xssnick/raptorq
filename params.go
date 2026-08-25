@@ -2,7 +2,6 @@ package raptorq
 
 import (
 	"fmt"
-	"sync"
 
 	"github.com/xssnick/raptorq/internal/discmath"
 )
@@ -17,7 +16,6 @@ type encodingRow struct {
 }
 
 type raptorParams struct {
-	_K       uint32
 	_KPadded uint32
 	_J       uint32
 	_S       uint32
@@ -32,65 +30,61 @@ type raptorParams struct {
 	// J-derived LT tuple constants, see calcEncodingRow
 	_JA     uint32
 	_BLocal uint32
-
-	zeroSymbol []byte
 }
 
-type paramsCacheKey struct {
-	symbolSize uint32
-	dataSize   uint32
+// Every field of raptorParams derives from the ParamsTable row that K selects,
+// so there are only len(ParamsTable) distinct values and all of them are built
+// once here. K itself is the only K-dependent value and lives on the Encoder
+// and the Decoder instead, which keeps these shared, immutable and pointer
+// free, so they never take part in a GC mark.
+var paramsByRow = buildParamsByRow()
+
+func buildParamsByRow() []raptorParams {
+	all := make([]raptorParams, len(ParamsTable))
+	for i := range ParamsTable {
+		raw := &ParamsTable[i]
+		p := &all[i]
+
+		p._KPadded = raw.KPadded
+		p._J = raw.J
+		p._S = raw.S
+		p._H = raw.H
+		p._W = raw.W
+		p._L = raw.KPadded + raw.S + raw.H
+		p._B = raw.W - raw.S
+
+		p._P = p._L - p._W
+		p._U = p._P - p._H
+		p._P1 = p._P + 1
+
+		for !isPrime(p._P1) {
+			p._P1++
+		}
+
+		p._JA = 53591 + p._J*997
+		if p._JA%2 == 0 {
+			p._JA++
+		}
+		p._BLocal = 10267 * (p._J + 1)
+	}
+	return all
 }
 
-var paramsCache sync.Map
-
-func (r *RaptorQ) calcParams(dataSize uint32) (*raptorParams, error) {
+// calcParams returns the shared params for dataSize together with K, the number
+// of source symbols. The returned params are immutable and shared by every
+// caller, so anything sized by the symbol size belongs to the caller.
+func (r *RaptorQ) calcParams(dataSize uint32) (*raptorParams, uint32, error) {
 	if r.symbolSz == 0 {
-		return nil, fmt.Errorf("symbol size cannot be zero")
-	}
-
-	key := paramsCacheKey{
-		symbolSize: r.symbolSz,
-		dataSize:   dataSize,
-	}
-	if cached, ok := paramsCache.Load(key); ok {
-		return cached.(*raptorParams), nil
+		return nil, 0, fmt.Errorf("symbol size cannot be zero")
 	}
 
 	k := (dataSize + r.symbolSz - 1) / r.symbolSz
-	raw, err := calcRawParams(k)
-	if err != nil {
-		return nil, fmt.Errorf("failed to calc params: %w", err)
+	i := rawParamsIndex(k)
+	if i < 0 {
+		return nil, 0, fmt.Errorf("failed to calc params: %w", errKTooBig)
 	}
 
-	p := &raptorParams{
-		_K:       k,
-		_KPadded: raw.KPadded,
-		_J:       raw.J,
-		_S:       raw.S,
-		_H:       raw.H,
-		_W:       raw.W,
-		_L:       raw.KPadded + raw.S + raw.H,
-		_B:       raw.W - raw.S,
-
-		zeroSymbol: make([]byte, r.symbolSz),
-	}
-
-	p._P = p._L - p._W
-	p._U = p._P - p._H
-	p._P1 = p._P + 1
-
-	for !isPrime(p._P1) {
-		p._P1++
-	}
-
-	p._JA = 53591 + p._J*997
-	if p._JA%2 == 0 {
-		p._JA++
-	}
-	p._BLocal = 10267 * (p._J + 1)
-
-	actual, _ := paramsCache.LoadOrStore(key, p)
-	return actual.(*raptorParams), nil
+	return &paramsByRow[i], k, nil
 }
 
 var degreeDistribution = [...]uint32{

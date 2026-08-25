@@ -11,6 +11,13 @@ import "testing"
 //
 // This test guards those invariants for every entry of the params table.
 func Test_ParamsTableInvariants(t *testing.T) {
+	// rawParamsIndex binary searches the table, so KPadded must stay strictly ascending
+	for i := 1; i < len(ParamsTable); i++ {
+		if ParamsTable[i].KPadded <= ParamsTable[i-1].KPadded {
+			t.Fatalf("row %d: KPadded %d does not follow %d", i, ParamsTable[i].KPadded, ParamsTable[i-1].KPadded)
+		}
+	}
+
 	for _, raw := range ParamsTable {
 		if !isPrime(raw.W) {
 			t.Fatalf("K'=%d: W=%d is not prime", raw.KPadded, raw.W)
