@@ -187,11 +187,9 @@ func (d *Decoder) DecodeInto(dst []byte) (bool, error) {
 // decodeInto recovers the data into out, which is d.dataSz to K*symbolSz long,
 // a possibly truncated last symbol is handled through a temporary buffer.
 func (d *Decoder) decodeInto(out []byte) (bool, error) {
-	// Build system for Solve from known symbols (no payload copy).
-	sz := d.k + d.slowNum
-	if sz < d.pm._KPadded {
-		sz = d.pm._KPadded
-	}
+	// Build system for Solve from known symbols (no payload copy),
+	// plus the K..K'-1 padding symbols.
+	sz := d.fastNum + d.slowNum + d.pm._KPadded - d.k
 	toRelax := getSymbolSlice(int(sz))
 	defer func() {
 		putSymbolSlice(toRelax)
@@ -213,10 +211,12 @@ func (d *Decoder) decodeInto(out []byte) (bool, error) {
 		toRelax = append(toRelax, symbol{ID: k, Data: d.slowSymbol(uint32(i) * d.symbolSz)})
 	}
 
-	// add padding empty symbols
-	if uint32(len(toRelax)) < d.pm._KPadded {
+	// The padding symbols K..K'-1 are known zeros and always belong to the
+	// system: extra received symbols must add equations, not replace these,
+	// otherwise the reception overhead doesn't lower the failure probability.
+	if d.k < d.pm._KPadded {
 		zero := zeroSymbol(d.symbolSz)
-		for i := uint32(len(toRelax)); i < d.pm._KPadded; i++ {
+		for i := d.k; i < d.pm._KPadded; i++ {
 			toRelax = append(toRelax, symbol{
 				ID:   i,
 				Data: zero,

@@ -193,9 +193,12 @@ func Benchmark_EncodeDecodeFuzz(b *testing.B) {
 			}
 		}
 
-		_, _, err = dec.Decode()
+		ok, _, err := dec.Decode()
 		if err != nil {
 			b.Fatal("decode err", err)
+		}
+		if !ok {
+			b.Fatal("not decoded")
 		}
 	}
 }
