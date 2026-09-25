@@ -4,30 +4,36 @@ import "errors"
 
 var ErrNotSolvable = errors.New("not solvable")
 
-// GaussianElimination reduces a (and applies the same row operations to d)
-// using Gauss-Jordan elimination with virtual row swaps through rowPerm.
-// No physical row permutation is performed: on return, the solution row r
-// lives at d.GetRow(rowPerm[r]).
+// GaussianElimination solves a*x = d for the a.ColsNum() unknown rows,
+// using virtual row swaps through rowPerm. No physical row permutation is
+// performed: on return, the solution row r lives at d.GetRow(rowPerm[r]).
+// a is destroyed; the d rows past the solution are left in an unspecified
+// state.
 //
-// rowPerm must be a.RowsNum() long, its content is fully overwritten.
+// It is an LU decomposition: the elimination runs on a alone, below the
+// pivots only, keeping each multiplier in the cell it eliminates, and d is
+// then updated once per row by a forward and a back substitution with the
+// multi-row kernels. The pivot at column k is the first nonzero in rowPerm
+// order among rows >= k, whose column k is the same as it would be in
+// Gauss-Jordan elimination, so the pivots and the solution are the same.
 //
-// The a operations are restricted to columns >= the pivot column: after
-// column c is eliminated, every row except its pivot has 0 there, and later
-// row operations only scale zeros or add rows that are themselves zero in
-// those columns, so the skipped prefix stays untouched either way.
-func GaussianElimination(a, d *MatrixGF256, rowPerm []uint32) (*MatrixGF256, error) {
-	rows := a.RowsNum()
+// rowPerm must be a.RowsNum() long, idx and muls at least 2*a.ColsNum()
+// long; all three are scratch that is fully overwritten.
+func GaussianElimination(a, d *MatrixGF256, rowPerm, idx []uint32, muls []byte) (*MatrixGF256, error) {
+	rows, cols := a.Rows, a.Cols
 
 	rowPerm = rowPerm[:rows]
 	for i := uint32(0); i < rows; i++ {
 		rowPerm[i] = i
 	}
 
-	for row := uint32(0); row < a.ColsNum(); row++ {
-		nonZero := row
+	// scale[k] is the inverse of pivot k, 1 when no scaling is needed
+	scale := muls[:cols]
+	for k := uint32(0); k < cols; k++ {
+		nonZero := k
 		var pivot uint8
 		for nonZero < rows {
-			if pivot = a.Get(rowPerm[nonZero], row); pivot != 0 {
+			if pivot = a.Get(rowPerm[nonZero], k); pivot != 0 {
 				break
 			}
 			nonZero++
@@ -36,38 +42,68 @@ func GaussianElimination(a, d *MatrixGF256, rowPerm []uint32) (*MatrixGF256, err
 			return nil, ErrNotSolvable
 		}
 
-		if nonZero != row {
-			rowPerm[nonZero], rowPerm[row] = rowPerm[row], rowPerm[nonZero]
+		if nonZero != k {
+			rowPerm[nonZero], rowPerm[k] = rowPerm[k], rowPerm[nonZero]
 		}
 
-		pr := rowPerm[row]
-		pivotA := a.GetRow(pr)[row:]
-		pivotD := d.GetRow(pr)
-
+		pivotA := a.GetRow(rowPerm[k])[k:]
+		scale[k] = 1
 		if pivot != 1 {
-			mul := OctInverse(pivot)
-			OctVecMul(pivotA, mul)
-			OctVecMul(pivotD, mul)
+			scale[k] = OctInverse(pivot)
+			OctVecMul(pivotA, scale[k])
 		}
 
-		for zeroRow := uint32(0); zeroRow < rows; zeroRow++ {
-			if zeroRow == row {
-				continue
-			}
-			tr := rowPerm[zeroRow]
-			targetA := a.GetRow(tr)[row:]
+		pivotTail := pivotA[1:]
+		for t := k + 1; t < rows; t++ {
+			targetA := a.GetRow(rowPerm[t])[k:]
 			x := targetA[0]
 			if x == 0 {
 				continue
 			}
+			// targetA[0] keeps x as the L multiplier of this row operation
 			if x == 1 {
-				OctVecAdd(targetA, pivotA)
-				OctVecAdd(d.GetRow(tr), pivotD)
+				OctVecAdd(targetA[1:], pivotTail)
 			} else {
-				OctVecMulAdd(targetA, pivotA, x)
-				OctVecMulAdd(d.GetRow(tr), pivotD, x)
+				OctVecMulAdd(targetA[1:], pivotTail, x)
 			}
 		}
+	}
+
+	addIdx, mulIdx, mulVals := idx[:cols], idx[cols:2*cols], muls[cols:2*cols]
+
+	// replay splits the cells of a row span into the rows to add and the
+	// rows to multiply-add (at rowPerm positions from+j) and applies them
+	replay := func(dRow, span []byte, from uint32) {
+		xs, ms, mv := addIdx[:0], mulIdx[:0], mulVals[:0]
+		for j, x := range span {
+			switch x {
+			case 0:
+			case 1:
+				xs = append(xs, rowPerm[from+uint32(j)])
+			default:
+				ms = append(ms, rowPerm[from+uint32(j)])
+				mv = append(mv, x)
+			}
+		}
+		OctVecAddRows(dRow, d, xs)
+		OctVecMulAddRows(dRow, d, ms, mv)
+	}
+
+	// forward: d[p_i] = scale_i * (d[p_i] ^ sum_{k<i} L[i][k] * d[p_k]),
+	// the row operations of the elimination in the order they happened
+	for i := uint32(0); i < cols; i++ {
+		pr := rowPerm[i]
+		dRow := d.GetRow(pr)
+		replay(dRow, a.GetRow(pr)[:i], 0)
+		if scale[i] != 1 {
+			OctVecMul(dRow, scale[i])
+		}
+	}
+
+	// back: d[p_i] ^= sum_{j>i} U[i][j] * d[p_j], U has a unit diagonal
+	for i := int(cols) - 1; i >= 0; i-- {
+		pr := rowPerm[i]
+		replay(d.GetRow(pr), a.GetRow(pr)[i+1:], uint32(i+1))
 	}
 
 	return d, nil

@@ -448,7 +448,8 @@ func (p *raptorParams) solve(symbols []symbol, keepResult bool, rowFor func(uint
 
 	// the solution row r of the elimination lives at smallC.GetRow(gaussPerm[r])
 	gaussPerm := arena.newU32Dirty(int(smallA.RowsNum()))
-	smallC, err := discmath.GaussianElimination(smallA, smallD, gaussPerm)
+	gaussIdx := arena.newU32Dirty(int(2 * nonU))
+	smallC, err := discmath.GaussianElimination(smallA, smallD, gaussPerm, gaussIdx, arena.newBytes(int(2*nonU)))
 	if err != nil {
 		arena.release()
 		if errors.Is(err, discmath.ErrNotSolvable) {
