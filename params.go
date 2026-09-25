@@ -210,14 +210,18 @@ func (r *encodingRow) encode(aUpper *upperMatrixBuilder, ri uint32, p *raptorPar
 func (r encodingRow) encodeGen(dst []byte, relaxed *discmath.MatrixGF256, p *raptorParams) {
 	w, p1, pp := p._W, p._P1, p._P
 
+	// d <= 30 and d1 <= 3, so the row list stays on the stack
+	var buf [33]uint32
+	rows := buf[:0]
+
 	b := r.b
-	copy(dst, relaxed.GetRow(b))
+	rows = append(rows, b)
 	for j := uint32(1); j < r.d; j++ {
 		b += r.a
 		if b >= w {
 			b -= w
 		}
-		discmath.OctVecAdd(dst, relaxed.GetRow(b))
+		rows = append(rows, b)
 	}
 
 	b1 := r.b1
@@ -228,7 +232,7 @@ func (r encodingRow) encodeGen(dst []byte, relaxed *discmath.MatrixGF256, p *rap
 		}
 	}
 
-	discmath.OctVecAdd(dst, relaxed.GetRow(w+b1))
+	rows = append(rows, w+b1)
 	for j := uint32(1); j < r.d1; j++ {
 		b1 += r.a1
 		if b1 >= p1 {
@@ -240,8 +244,10 @@ func (r encodingRow) encodeGen(dst []byte, relaxed *discmath.MatrixGF256, p *rap
 				b1 -= p1
 			}
 		}
-		discmath.OctVecAdd(dst, relaxed.GetRow(w+b1))
+		rows = append(rows, w+b1)
 	}
+
+	discmath.OctVecAddRowsTo(dst, nil, relaxed, rows)
 }
 
 func (p *raptorParams) genSymbol(relaxed *discmath.MatrixGF256, symbolSz, id uint32) []byte {
