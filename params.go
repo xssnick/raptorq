@@ -134,31 +134,32 @@ func (p *raptorParams) calcEncodingRow(x uint32) encodingRow {
 	}
 }
 
-// hdpcMultiply computes the HDPC rows for v; ab holds the precomputed
-// (a, b) random row pairs for every column (see the hdpcAB block in solve),
-// they depend only on the column index so they are shared between calls.
-func (p *raptorParams) hdpcMultiply(arena *matrixArena, v *discmath.MatrixGF256, ab []uint32) *discmath.MatrixGF256 {
-	alpha := discmath.OctExp(1) // == 2, so RowAddMul never hits its 0/1 fast paths
-	prev := v.GetRow(0)
-	for i := uint32(1); i < v.RowsNum(); i++ {
-		cur := v.GetRow(i)
-		discmath.OctVecMulAdd(cur, prev, alpha)
-		prev = cur
+// hdpcStream overwrites u (H rows) with HDPC * v, where v has K'+S rows and
+// row col of v is rowAt(col), nil for a zero row. ab holds the precomputed
+// (a, b) MT row pairs of every column but the last (see the hdpcAB block in
+// solve), acc is a len(u row) scratch.
+//
+// HDPC = MT * GAMMA with GAMMA[i][j] = alpha^(i-j) for i >= j, so
+// (GAMMA v)_col = alpha*(GAMMA v)_{col-1} ^ v_col: the chain is kept in the
+// single accumulator row and each v row is read once, v is never built.
+func (p *raptorParams) hdpcStream(u *discmath.MatrixGF256, acc []byte, ab []uint32, rowAt func(col uint32) []byte) {
+	clear(u.Data)
+	clear(acc)
+
+	last := p._KPadded + p._S - 1
+	for col := uint32(0); col < last; col++ {
+		discmath.OctHdpcStep(acc, rowAt(col), u.GetRow(ab[2*col]), u.GetRow(ab[2*col+1]))
 	}
 
-	u := arena.newGF256(p._H, v.ColsNum())
-	last := v.GetRow(v.RowsNum() - 1)
-	u.RowSet(0, last) // OctExp(0) == 1 and the row is zeroed
+	// the last MT column is alpha^i in row i instead of an (a, b) pair
+	discmath.OctVecMul(acc, discmath.OctExp(1))
+	if v := rowAt(last); v != nil {
+		discmath.OctVecAdd(acc, v)
+	}
+	u.RowAdd(0, acc) // OctExp(0) == 1
 	for i := uint32(1); i < p._H; i++ {
-		u.RowAddMul(i, last, discmath.OctExp(i%255))
+		u.RowAddMul(i, acc, discmath.OctExp(i%255))
 	}
-
-	for col := uint32(0); col+1 < v.RowsNum(); col++ {
-		row := v.GetRow(col)
-		u.RowAdd(ab[2*col], row)
-		u.RowAdd(ab[2*col+1], row)
-	}
-	return u
 }
 
 func (r *encodingRow) Size() uint32 {
