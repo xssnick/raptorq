@@ -236,9 +236,11 @@ func (p *raptorParams) newSolveArena(symbols []symbol) *matrixArena {
 	rows := p._S + uint32(len(symbols))
 	dataRows := p._S + p._H + uint32(len(symbols))
 
-	// dominated by: D, C and the HDPC scratch (each ~rows*symSz);
+	// dominated by the symbol-sized rows: U^-1 D_upper and smallD
+	// (together dataRows) and C (L, only in the arena for a decode, but
+	// counted either way so an encoder's pooled arena also fits a decode);
 	// the sparse blocks and indexes are covered by the L*L/8 slack
-	estimate := int((dataRows+3*p._L)*symSz + p._L*p._L/8)
+	estimate := int((dataRows+p._L)*symSz + p._L*p._L/8)
 	const maxInitialArena = 64 << 20
 	if estimate > maxInitialArena {
 		estimate = maxInitialArena
@@ -257,32 +259,6 @@ func (p *raptorParams) newSolveArena(symbols []symbol) *matrixArena {
 		arena.encodingRows = make([]encodingRow, 0, len(symbols))
 	}
 	return arena
-}
-
-// createDPermuted builds D with every row already at its permuted position
-// (original row r lands at rPerm[r]), so no separate permutation pass is needed.
-// The S prefix rows and H suffix rows of the original layout are zero,
-// the middle rows carry the symbols.
-func (p *raptorParams) createDPermuted(arena *matrixArena, symbols []symbol, rPerm []uint32) *discmath.MatrixGF256 {
-	symSz := uint32(len(symbols[0].Data))
-	rows := p._S + p._H + uint32(len(symbols))
-	d := arena.newGF256Dirty(rows, symSz)
-
-	for r := uint32(0); r < p._S; r++ {
-		clear(d.GetRow(rPerm[r]))
-	}
-
-	offset := p._S
-	for i := range symbols {
-		d.RowSet(rPerm[offset], symbols[i].Data)
-		offset++
-	}
-
-	for r := offset; r < rows; r++ {
-		clear(d.GetRow(rPerm[r]))
-	}
-
-	return d
 }
 
 func (p *raptorParams) Solve(symbols []Symbol) (*discmath.MatrixGF256, error) {
@@ -371,58 +347,41 @@ func (p *raptorParams) solve(symbols []symbol, keepResult bool, rowFor func(uint
 
 	uSize, rowPermutation, colPermutation := inactivateDecode(arena, aUpperRows, p._L, p._P, upperBuilder.entries)
 
-	dataRows := p._S + p._H + uint32(len(symbols))
-	for len(rowPermutation) < int(dataRows) {
-		rowPermutation = append(rowPermutation, uint32(len(rowPermutation)))
-	}
-
 	rPermutation := inversePermutationArena(arena, rowPermutation)
 	cPermutation := inversePermutationArena(arena, colPermutation)
 
-	d := p.createDPermuted(arena, symbols, rPermutation)
+	// D is never built: the D row of permuted upper row r is the payload of
+	// the symbol behind it (nil for an all-zero LDPC row), which the row
+	// kernels read directly as their first source
+	symSz := uint32(len(symbols[0].Data))
+	dRow := func(r uint32) []byte {
+		if o := rowPermutation[r]; o >= p._S {
+			return symbols[o-p._S].Data
+		}
+		return nil
+	}
 
-	// smallA/smallD are allocated combined, their upper/lower halves are
-	// zero-copy row-range views; smallA must be fully zeroed (its blocks are
-	// filled sparsely), smallD is fully overwritten from d blocks
-	symSz := d.ColsNum()
+	// smallA is allocated combined, its upper/lower halves are zero-copy
+	// row-range views; it must be fully zeroed (its blocks are filled sparsely)
 	smallA := arena.newGF256(aUpperRows-uSize+p._H, p._L-uSize)
 	smallAUpper := arena.newGF256FromData(aUpperRows-uSize, smallA.Cols, smallA.Data[:(aUpperRows-uSize)*smallA.Cols])
 	smallALower := arena.newGF256FromData(p._H, smallA.Cols, smallA.Data[(aUpperRows-uSize)*smallA.Cols:])
 
-	e, gLeft, upperIndex := buildPermutedUpperArena(arena, upperBuilder.entries, rPermutation, cPermutation, aUpperRows, p._L, uSize, smallAUpper)
+	e, gIdx, upperIndex := buildPermutedUpperArena(arena, upperBuilder.entries, rPermutation, cPermutation, aUpperRows, p._L, uSize, smallAUpper)
 
-	// c rows are placed directly at their final (inverse column permutation)
-	// positions, so no permutation pass is needed at the end: assembly row r
-	// of the solution lives at c row colPermutation[r].
-	var c *discmath.MatrixGF256
-	if keepResult {
-		c = discmath.NewMatrixGF256(p._L, d.ColsNum())
-	} else {
-		c = arena.newGF256Dirty(p._L, d.ColsNum())
-	}
+	// Forward substitution through U, which is unit lower-triangular (see
+	// buildPermutedUpperArena): row r of U^-1 [E | D] is [E | D]_r ^ the XOR
+	// of the finished rows c < r with U[r][c] = 1, each row is written once
+	dUpper := arena.newGF256Dirty(uSize, symSz)
 	for r := uint32(0); r < uSize; r++ {
-		c.RowSet(colPermutation[r], d.GetRow(r))
+		cols := upperIndex.rowUFor(r)
+		for _, col := range cols {
+			e.RowAdd(r, e.GetRow(col))
+		}
+		discmath.OctVecAddRowsTo(dUpper.GetRow(r), dRow(r), dUpper, cols)
 	}
 
-	// Make U Identity matrix and calculate E and D_upper.
-	for i := uint32(0); i < uSize; i++ {
-		rows := upperIndex.colRowsFor(i)
-		if len(rows) == 0 {
-			continue
-		}
-		eRow := e.GetRow(i)
-		dRow := d.GetRow(i)
-		for _, row := range rows {
-			if row == i {
-				continue
-			}
-
-			e.RowAdd(row, eRow)
-			d.RowAdd(row, dRow)
-		}
-	}
-
-	// the HDPC (a, b) random pairs are identical for every hdpcMultiply call
+	// the HDPC (a, b) random pairs are identical for both hdpcStream calls
 	// in this solve, compute them once; a+r+1 < 2H so one conditional
 	// subtract equals % H
 	tRows := p._KPadded + p._S
@@ -437,71 +396,60 @@ func (p *raptorParams) solve(symbols []symbol, keepResult bool, rowFor func(uint
 		hdpcAB[2*col+1] = b
 	}
 
-	// rows of t not covered by colPermutation[:covered] are exactly the
-	// in-range entries of the permutation tail, colPermutation is a
-	// bijection on [0, L) and tRows < L
-	clearHDPCGaps := func(t *discmath.MatrixGF256, covered uint32) {
-		for _, row := range colPermutation[covered:] {
-			if row < tRows {
-				clear(t.GetRow(row))
-			}
+	lower := aUpperRows - uSize
+	nonU := p._L - uSize
+	scratch := arena.newBytes(int(nonU))
+	hdpcAcc := arena.newBytes(int(max(nonU, symSz)))
+
+	// smallAUpper += gLeft * E', one GF2 row accumulation per gLeft cell
+	gE := arena.newGF2(lower, nonU)
+	for l := uint32(0); l < lower; l++ {
+		for _, col := range gIdx.rowColsFor(l) {
+			gE.RowAdd(l, e.GetRow(col))
 		}
+		gE.RowToGF256(l, scratch)
+		smallAUpper.RowAdd(l, scratch)
 	}
 
-	hdpcMul := func(m *discmath.MatrixGF256) *discmath.MatrixGF256 {
-		t := arena.newGF256Dirty(tRows, m.ColsNum())
-		for i := uint32(0); i < m.RowsNum(); i++ {
-			t.RowSet(colPermutation[i], m.GetRow(i))
+	// smallALower = HDPC * [E' ; unit columns] + [0 | I_H]. Row col of the
+	// HDPC input is the column at permuted position inv: E' row inv for a U
+	// column, else the unit vector of smallA column inv-uSize (the HDPC
+	// block right of U). Original columns < K'+S never sit in the last H
+	// permuted positions (the identity part), so inv-uSize < nonU-H.
+	p.hdpcStream(smallALower, hdpcAcc[:nonU], hdpcAB, func(col uint32) []byte {
+		if inv := cPermutation[col]; inv < uSize {
+			e.RowToGF256(inv, scratch)
+		} else {
+			clear(scratch)
+			scratch[inv-uSize] = 1
 		}
-		clearHDPCGaps(t, m.RowsNum())
-		return p.hdpcMultiply(arena, t, hdpcAB)
-	}
-
-	// same as hdpcMul but expands GF2 bit rows straight into the scatter
-	// destination, skipping the intermediate dense matrix
-	hdpcMulGF2 := func(m *discmath.PlainMatrixGF2) *discmath.MatrixGF256 {
-		t := arena.newGF256Dirty(tRows, m.ColsNum())
-		for i := uint32(0); i < m.RowsNum(); i++ {
-			m.RowToGF256(i, t.GetRow(colPermutation[i]))
-		}
-		clearHDPCGaps(t, m.RowsNum())
-		return p.hdpcMultiply(arena, t, hdpcAB)
-	}
-
-	smallAUpper.Add(plainGF2ToGF256Arena(arena, mulGF2Arena(arena, e, gLeft)))
-
-	// small A lower identity part
+		return scratch
+	})
 	for i := uint32(1); i <= p._H; i++ {
-		smallALower.Set(smallALower.RowsNum()-i, smallALower.ColsNum()-i, 1)
+		smallALower.Data[(p._H-i)*nonU+nonU-i] ^= 1
 	}
 
-	// calculate HDPC right and set it into small A lower
-	t := arena.newGF256(tRows, tRows-uSize)
-	for i := uint32(0); i < t.ColsNum(); i++ {
-		t.Set(colPermutation[i+t.RowsNum()-t.ColsNum()], i, 1)
+	smallD := arena.newGF256Dirty(lower+p._H, symSz)
+	smallDUpper := arena.newGF256FromData(lower, symSz, smallD.Data[:lower*symSz])
+	smallDLower := arena.newGF256FromData(p._H, symSz, smallD.Data[lower*symSz:])
+
+	// smallDUpper = D_lower ^ gLeft * U^-1 D_upper
+	for l := uint32(0); l < lower; l++ {
+		discmath.OctVecAddRowsTo(smallDUpper.GetRow(l), dRow(uSize+l), dUpper, gIdx.rowColsFor(l))
 	}
-	hdpcRight := p.hdpcMultiply(arena, t, hdpcAB)
-	smallALower.SetFrom(hdpcRight, 0, 0)
 
-	// ALower += hdpc(E)
-	smallALower.Add(hdpcMulGF2(e))
-
-	// dUpper is a read-only view of the first uSize rows of d, no copy needed
-	dUpper := arena.newGF256FromData(uSize, symSz, d.Data[:uSize*d.Cols])
-
-	smallD := arena.newGF256Dirty(aUpperRows-uSize+p._H, symSz)
-	smallDUpper := arena.newGF256FromData(aUpperRows-uSize, symSz, smallD.Data[:(aUpperRows-uSize)*symSz])
-	smallDLower := arena.newGF256FromData(p._H, symSz, smallD.Data[(aUpperRows-uSize)*symSz:])
-
-	smallDUpper.SetFromBlock(d, uSize, 0, smallDUpper.RowsNum(), smallDUpper.ColsNum(), 0, 0)
-	mulSparseInto(smallDUpper, dUpper, gLeft)
-
-	smallDLower.SetFromBlock(d, aUpperRows, 0, smallDLower.RowsNum(), smallDLower.ColsNum(), 0, 0)
-	smallDLower.Add(hdpcMul(dUpper))
+	// smallDLower = HDPC * U^-1 D_upper, the D rows of the HDPC constraints are zero
+	p.hdpcStream(smallDLower, hdpcAcc[:symSz], hdpcAB, func(col uint32) []byte {
+		if inv := cPermutation[col]; inv < uSize {
+			return dUpper.GetRow(inv)
+		}
+		return nil
+	})
 
 	// the solution row r of the elimination lives at smallC.GetRow(gaussPerm[r])
 	gaussPerm := arena.newU32Dirty(int(smallA.RowsNum()))
-	smallC, err := discmath.GaussianElimination(smallA, smallD, gaussPerm)
+	gaussIdx := arena.newU32Dirty(int(2 * nonU))
+	smallC, err := discmath.GaussianElimination(smallA, smallD, gaussPerm, gaussIdx, arena.newBytes(int(2*nonU)))
 	if err != nil {
 		arena.release()
 		if errors.Is(err, discmath.ErrNotSolvable) {
@@ -510,17 +458,29 @@ func (p *raptorParams) solve(symbols []symbol, keepResult bool, rowFor func(uint
 		return nil, nil, fmt.Errorf("failed to calc gauss elimination: %w", err)
 	}
 
-	for r := uint32(0); r < c.RowsNum()-uSize; r++ {
+	// c rows are placed directly at their final (inverse column permutation)
+	// positions, so no permutation pass is needed at the end: assembly row r
+	// of the solution lives at c row colPermutation[r].
+	var c *discmath.MatrixGF256
+	if keepResult {
+		c = discmath.NewMatrixGF256(p._L, symSz)
+	} else {
+		c = arena.newGF256Dirty(p._L, symSz)
+	}
+	for r := uint32(0); r < nonU; r++ {
 		c.RowSet(colPermutation[uSize+r], smallC.GetRow(gaussPerm[r]))
 	}
-	for row := uint32(0); row < uSize; row++ {
-		cRow := c.GetRow(colPermutation[row])
-		for _, col := range upperIndex.rowColsFor(row) {
-			if col == row {
-				continue
-			}
-			discmath.OctVecAdd(cRow, c.GetRow(colPermutation[col]))
+
+	// Back-substitution through the original upper rows: x_r = D_r ^ the XOR
+	// of the other solved columns of row r, its U part (c < r) is already done
+	srcIdx := arena.newU32Dirty(int(upperIndex.maxRowLen))
+	for r := uint32(0); r < uSize; r++ {
+		cols := upperIndex.rowColsFor(r)
+		idx := srcIdx[:len(cols)]
+		for i, col := range cols {
+			idx[i] = colPermutation[col]
 		}
+		discmath.OctVecAddRowsTo(c.GetRow(colPermutation[r]), dRow(r), c, idx)
 	}
 
 	if keepResult {
@@ -530,11 +490,14 @@ func (p *raptorParams) solve(symbols []symbol, keepResult bool, rowFor func(uint
 	return c, arena.release, nil
 }
 
+// upperSparseIndex is a row index (CSR) of a sparse binary block. For the U
+// rows each row is stored as [below-diagonal U cells | E cells], rowMid
+// marks the split and the unit diagonal is implicit.
 type upperSparseIndex struct {
 	rowStarts []uint32
 	rowCols   []uint32
-	colStarts []uint32
-	colRows   []uint32
+	rowMid    []uint32
+	maxRowLen uint32
 }
 
 type upperMatrixEntries struct {
@@ -567,30 +530,21 @@ func (b *upperMatrixBuilder) set(row, col uint32) {
 	b.entries.n++
 }
 
-func newUpperSparseIndexFromCounts(arena *matrixArena, rowCounts, colCounts []uint32, rowNNZ, colNNZ, rowsLimit, colIndexLimit uint32) upperSparseIndex {
-	// all four arrays are fully written before the first read: the starts by
-	// the prefix sums below, the cols/rows by the caller's cursor scatter
+// newRowIndex lays out the row starts from the per-row counts; the caller
+// scatters the cells with a cursor copy of rowStarts
+func newRowIndex(arena *matrixArena, counts []uint32, nnz uint32) upperSparseIndex {
+	rows := uint32(len(counts))
 	idx := upperSparseIndex{
-		rowStarts: arena.newU32Dirty(int(rowsLimit + 1)),
-		rowCols:   arena.newU32Dirty(int(rowNNZ)),
-		colStarts: arena.newU32Dirty(int(colIndexLimit + 1)),
-		colRows:   arena.newU32Dirty(int(colNNZ)),
+		rowStarts: arena.newU32Dirty(int(rows + 1)),
+		rowCols:   arena.newU32Dirty(int(nnz)),
 	}
-
 	offset := uint32(0)
-	for row := uint32(0); row < rowsLimit; row++ {
-		idx.rowStarts[row] = offset
-		offset += rowCounts[row]
+	for r, n := range counts {
+		idx.rowStarts[r] = offset
+		offset += n
+		idx.maxRowLen = max(idx.maxRowLen, n)
 	}
-	idx.rowStarts[rowsLimit] = offset
-
-	offset = 0
-	for col := uint32(0); col < colIndexLimit; col++ {
-		idx.colStarts[col] = offset
-		offset += colCounts[col]
-	}
-	idx.colStarts[colIndexLimit] = offset
-
+	idx.rowStarts[rows] = offset
 	return idx
 }
 
@@ -598,8 +552,9 @@ func (idx upperSparseIndex) rowColsFor(row uint32) []uint32 {
 	return idx.rowCols[idx.rowStarts[row]:idx.rowStarts[row+1]]
 }
 
-func (idx upperSparseIndex) colRowsFor(col uint32) []uint32 {
-	return idx.colRows[idx.colStarts[col]:idx.colStarts[col+1]]
+// rowUFor returns the below-diagonal U columns of U row row, all < row
+func (idx upperSparseIndex) rowUFor(row uint32) []uint32 {
+	return idx.rowCols[idx.rowStarts[row]:idx.rowMid[row]]
 }
 
 func inversePermutationArena(arena *matrixArena, mut []uint32) []uint32 {
@@ -614,94 +569,97 @@ func inversePermutationArena(arena *matrixArena, mut []uint32) []uint32 {
 // buildPermutedUpperArena splits the permuted sparse upper matrix directly into the
 // blocks the solver needs, without materializing the dense permuted matrix:
 //
-//	| U (idx only) | E (GF2)         |   rows < uSize
-//	| gLeft        | smallAUpper bin |   rows >= uSize
+//	| U (idx only)      | E (GF2, idx)    |   rows < uSize
+//	| gLeft (gIdx only) | smallAUpper bin |   rows >= uSize
 //
-// It also builds the sparse row/col index of the top uSize rows (U and E parts).
+// The inactivation decoder makes U unit lower-triangular: when it picks a row,
+// every still active column of that row is either the row's pivot or gets
+// inactivated in the same step, so a U row has no cell right of its diagonal.
+// This is checked here, the forward and back substitutions rely on it.
+//
 // smallAUpper is filled by the caller-provided zeroed view. The permuted upper
 // coordinates are compacted in place into entries.rows/cols, which are dead
-// after this call: at iteration i the write index rowNNZ <= i, and the cell at
-// i was already consumed at the top of the iteration.
-func buildPermutedUpperArena(arena *matrixArena, entries upperMatrixEntries, rPerm, cPerm []uint32, rows, cols, uSize uint32, smallAUpper *discmath.MatrixGF256) (*discmath.PlainMatrixGF2, *discmath.MatrixGF256, upperSparseIndex) {
+// after this call: at iteration i the write index nnz <= i, and the cell at i
+// was already consumed at the top of the iteration.
+func buildPermutedUpperArena(arena *matrixArena, entries upperMatrixEntries, rPerm, cPerm []uint32, rows, cols, uSize uint32, smallAUpper *discmath.MatrixGF256) (*discmath.PlainMatrixGF2, upperSparseIndex, upperSparseIndex) {
 	if !entries.valid() {
 		panic("raptorq: upper matrix entries overflow")
 	}
 
+	lower := rows - uSize
 	e := arena.newGF2(uSize, cols-uSize)
-	gLeft := arena.newGF256(rows-uSize, uSize)
 
 	rowCounts := arena.newU32(int(uSize))
-	colCounts := arena.newU32(int(uSize))
+	uCounts := arena.newU32(int(uSize))
+	gCounts := arena.newU32(int(lower))
 	upperRows := entries.rows[:entries.n]
 	upperCols := entries.cols[:entries.n]
 
+	nnz := uint32(0)
 	rowNNZ := uint32(0)
-	colNNZ := uint32(0)
 	for i := uint32(0); i < entries.n; i++ {
 		dstRow := rPerm[entries.rows[i]]
 		dstCol := cPerm[entries.cols[i]]
-		if dstRow < uSize {
-			upperRows[rowNNZ] = dstRow
-			upperCols[rowNNZ] = dstCol
+		switch {
+		case dstRow < uSize && dstCol < uSize:
+			if dstCol == dstRow {
+				continue // the implicit unit diagonal
+			}
+			if dstCol > dstRow {
+				panic("raptorq: U is not lower triangular")
+			}
+			uCounts[dstRow]++
 			rowCounts[dstRow]++
 			rowNNZ++
-			if dstCol < uSize {
-				colCounts[dstCol]++
-				colNNZ++
-			} else {
-				e.Set(dstRow, dstCol-uSize)
-			}
-		} else if dstCol < uSize {
-			gLeft.Set(dstRow-uSize, dstCol, 1)
-		} else {
+		case dstRow < uSize:
+			e.Set(dstRow, dstCol-uSize)
+			rowCounts[dstRow]++
+			rowNNZ++
+		case dstCol < uSize:
+			gCounts[dstRow-uSize]++
+		default:
 			smallAUpper.Set(dstRow-uSize, dstCol-uSize, 1)
+			continue
 		}
+		upperRows[nnz] = dstRow
+		upperCols[nnz] = dstCol
+		nnz++
 	}
 
-	idx := newUpperSparseIndexFromCounts(arena, rowCounts, colCounts, rowNNZ, colNNZ, uSize, uSize)
-	rowCursor := arena.newU32Dirty(int(uSize))
-	colCursor := arena.newU32Dirty(int(uSize))
-	copy(rowCursor, idx.rowStarts[:uSize])
-	copy(colCursor, idx.colStarts[:uSize])
+	idx := newRowIndex(arena, rowCounts, rowNNZ)
+	gIdx := newRowIndex(arena, gCounts, nnz-rowNNZ)
 
-	for i := uint32(0); i < rowNNZ; i++ {
+	// U cells fill each U row from its start, E cells from rowMid on
+	idx.rowMid = arena.newU32Dirty(int(uSize))
+	uCursor := arena.newU32Dirty(int(uSize))
+	eCursor := arena.newU32Dirty(int(uSize))
+	gCursor := arena.newU32Dirty(int(lower))
+	for r := uint32(0); r < uSize; r++ {
+		uCursor[r] = idx.rowStarts[r]
+		idx.rowMid[r] = idx.rowStarts[r] + uCounts[r]
+		eCursor[r] = idx.rowMid[r]
+	}
+	copy(gCursor, gIdx.rowStarts[:lower])
+
+	for i := uint32(0); i < nnz; i++ {
 		dstRow := upperRows[i]
 		dstCol := upperCols[i]
 
-		rowPos := rowCursor[dstRow]
-		idx.rowCols[rowPos] = dstCol
-		rowCursor[dstRow] = rowPos + 1
-
-		if dstCol < uSize {
-			colPos := colCursor[dstCol]
-			idx.colRows[colPos] = dstRow
-			colCursor[dstCol] = colPos + 1
+		switch {
+		case dstRow >= uSize:
+			pos := gCursor[dstRow-uSize]
+			gIdx.rowCols[pos] = dstCol
+			gCursor[dstRow-uSize] = pos + 1
+		case dstCol < uSize:
+			pos := uCursor[dstRow]
+			idx.rowCols[pos] = dstCol
+			uCursor[dstRow] = pos + 1
+		default:
+			pos := eCursor[dstRow]
+			idx.rowCols[pos] = dstCol
+			eCursor[dstRow] = pos + 1
 		}
 	}
 
-	return e, gLeft, idx
-}
-
-func mulSparseInto(dst, m, s *discmath.MatrixGF256) {
-	for row := uint32(0); row < s.Rows; row++ {
-		rowData := s.GetRow(row)
-		dstRow := dst.GetRow(row)
-		for col, val := range rowData {
-			if val != 0 {
-				discmath.OctVecAdd(dstRow, m.GetRow(uint32(col)))
-			}
-		}
-	}
-}
-
-func mulGF2Arena(arena *matrixArena, m *discmath.PlainMatrixGF2, s *discmath.MatrixGF256) *discmath.PlainMatrixGF2 {
-	return m.MulTo(s, arena.newGF2(s.RowsNum(), m.ColsNum()))
-}
-
-func plainGF2ToGF256Arena(arena *matrixArena, m *discmath.PlainMatrixGF2) *discmath.MatrixGF256 {
-	mg := arena.newGF256Dirty(m.RowsNum(), m.ColsNum())
-	for row := uint32(0); row < m.RowsNum(); row++ {
-		m.RowToGF256(row, mg.GetRow(row))
-	}
-	return mg
+	return e, gIdx, idx
 }
