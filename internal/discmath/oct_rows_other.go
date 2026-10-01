@@ -9,6 +9,11 @@ func octAddRows(dst, init []byte, m *MatrixGF256, idx []uint32) {
 	if n == 0 {
 		return
 	}
+	if n <= 32 {
+		// a few words: cheaper than a copy and one OctVecAdd call per source
+		octAddRowsWords(dst, init, m, idx, 0)
+		return
+	}
 	cols := int(m.Cols)
 	switch {
 	case init == nil && len(idx) > 0:

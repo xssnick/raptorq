@@ -22,20 +22,8 @@ func octAddRows(dst, init []byte, m *MatrixGF256, idx []uint32) {
 		octAddRowsAsm(unsafe.SliceData(dst), unsafe.SliceData(init), unsafe.SliceData(m.Data),
 			int(m.Cols), blocks, unsafe.SliceData(idx), len(idx))
 	}
-	if blocks == n {
-		return
-	}
-
-	cols := int(m.Cols)
-	for i := blocks; i < n; i++ {
-		var x byte
-		if init != nil {
-			x = init[i]
-		}
-		for _, r := range idx {
-			x ^= m.Data[int(r)*cols+i]
-		}
-		dst[i] = x
+	if blocks < n {
+		octAddRowsWords(dst, init, m, idx, blocks) // the last < 16 bytes
 	}
 }
 
